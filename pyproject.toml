@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book-search"
+version = "0.1.0"
+description = "Reading companion for EPUB and PDF books — ingest, search, and discuss"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+llm = [
+  "openai>=2.16.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+book-search = "book_search.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
