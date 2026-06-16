@@ -5,10 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from .companion import CompanionError, answer_question, chat_loop
+from .citations import print_sources
+from .companion import CompanionError, answer_question, chat_loop, set_reading_position
 from .llm import RECOMMENDED_MODELS
 from .pipeline import ingest_source, list_books, load_book_record
 from .paths import WorkspaceDiscoveryError
+from .retrieval import search_chapters
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,22 +35,76 @@ def build_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="Show metadata and chapter list for an ingested book")
     show.add_argument("book_id", help="Previously ingested book id")
 
+    chapters = subparsers.add_parser("chapters", help="List chapters for an ingested book")
+    chapters.add_argument("book_id", help="Previously ingested book id")
+
+    search = subparsers.add_parser("search", help="Search chapter text without calling an LLM")
+    search.add_argument("book_id", help="Previously ingested book id")
+    search.add_argument("query", help="Search query")
+    search.add_argument("--chapter", type=int, help="Bias retrieval toward this chapter")
+    search.add_argument("--spoiler", type=int, help="Only use content up to this chapter")
+    search.add_argument("--limit", type=int, default=10, help="Maximum chunks to return")
+
+    position = subparsers.add_parser("position", help="Get or set persisted reading position")
+    position.add_argument("book_id", help="Previously ingested book id")
+    position_sub = position.add_subparsers(dest="position_command", required=False)
+
+    position_show = position_sub.add_parser("show", help="Show saved reading position")
+    position_show.set_defaults(position_command="show")
+
+    position_set = position_sub.add_parser("set", help="Set saved reading position")
+    position_set.add_argument("chapter", type=int, help="Current chapter number")
+    position_set.add_argument("--spoiler", type=int, help="Spoiler guard chapter limit")
+    position_set.set_defaults(position_command="set")
+
     ask = subparsers.add_parser("ask", help="Ask a one-shot question about an ingested book")
     ask.add_argument("book_id", help="Previously ingested book id")
     ask.add_argument("question", help="Question to ask")
     ask.add_argument("--chapter", type=int, help="Bias retrieval toward this chapter")
     ask.add_argument("--spoiler", type=int, help="Only use content up to this chapter")
     ask.add_argument("--model", help="Model slug (OpenRouter or OpenAI; see `book-search models`)")
+    ask.add_argument("--show-sources", action="store_true", help="Print retrieved chunk excerpts")
 
     chat = subparsers.add_parser("chat", help="Interactive reading companion")
     chat.add_argument("book_id", help="Previously ingested book id")
     chat.add_argument("--chapter", type=int, help="Initial reading position")
     chat.add_argument("--spoiler", type=int, help="Only use content up to this chapter")
     chat.add_argument("--model", help="Model slug (OpenRouter or OpenAI; see `book-search models`)")
+    chat.add_argument("--show-sources", action="store_true", help="Always print retrieved chunk excerpts")
 
     subparsers.add_parser("models", help="List recommended chat models")
 
     return parser
+
+
+def _print_chapter_list(record: dict) -> None:
+    chapters = record.get("chapters", [])
+    if not isinstance(chapters, list) or not chapters:
+        print("No chapters found.")
+        return
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        print(
+            f"  {int(chapter.get('index', 0)):>3}  "
+            f"{str(chapter.get('title', '?'))[:60]:60s}  "
+            f"{int(chapter.get('word_count', 0)):>6,} words"
+        )
+
+
+def _print_ask_sources(result: dict, *, show_sources: bool) -> None:
+    if show_sources:
+        print_sources(result.get("chunks", []))
+    elif result.get("sources"):
+        print("\nSources:")
+        for source in result["sources"]:
+            print(f"  • {source['chunk_id']} — Ch {source['chapter_index']}: {source['chapter_title']}")
+
+    citation_check = result.get("citation_check", {})
+    unknown = citation_check.get("unknown_chunk_ids") or []
+    if unknown:
+        print("\nCitation check:")
+        print(f"  ⚠ Model cited chunk ids not in retrieval: {', '.join(unknown)}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,6 +154,52 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nBook directory: {paths.book_dir}")
             return 0
 
+        if args.command == "chapters":
+            record, _paths = load_book_record(args.book_id, workspace)
+            print(f"{record.get('title', args.book_id)} — {record.get('chapter_count', 0)} chapters\n")
+            _print_chapter_list(record)
+            return 0
+
+        if args.command == "search":
+            record, paths = load_book_record(args.book_id, workspace)
+            chapters = record.get("chapters", [])
+            snippets = search_chapters(
+                paths.chapters_dir,
+                args.query,
+                chapters if isinstance(chapters, list) else [],
+                book_id=str(record.get("book_id", args.book_id)),
+                current_chapter=args.chapter,
+                max_chapter=args.spoiler,
+                limit=args.limit,
+            )
+            if not snippets:
+                print("No matching chunks found.")
+                return 0
+            print_sources(snippets, heading=f"Search results ({len(snippets)})")
+            return 0
+
+        if args.command == "position":
+            _paths = load_book_record(args.book_id, workspace)[1]
+            if args.position_command in (None, "show"):
+                from .companion import load_session
+
+                session = load_session(_paths)
+                print(f"Current chapter: {session.get('current_chapter') or 'not set'}")
+                print(f"Spoiler guard: {session.get('max_chapter') or 'off'}")
+                return 0
+            if args.position_command == "set":
+                session = set_reading_position(
+                    _paths,
+                    current_chapter=args.chapter,
+                    max_chapter=args.spoiler,
+                )
+                print(f"Saved current chapter: {session.get('current_chapter')}")
+                if session.get("max_chapter") is not None:
+                    print(f"Saved spoiler guard: chapters 1–{session['max_chapter']}")
+                return 0
+            parser.parse_args(["position", "--help"])
+            return 0
+
         if args.command == "ask":
             record, paths = load_book_record(args.book_id, workspace)
             result = answer_question(
@@ -109,10 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
             )
             print(result["answer"])
-            if result.get("sources"):
-                print("\nSources:")
-                for source in result["sources"]:
-                    print(f"  • Ch {source['chapter_index']}: {source['chapter_title']}")
+            _print_ask_sources(result, show_sources=args.show_sources)
             return 0
 
         if args.command == "chat":
@@ -123,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 current_chapter=args.chapter,
                 max_chapter=args.spoiler,
                 model=args.model,
+                show_sources=args.show_sources,
             )
             return 0
 

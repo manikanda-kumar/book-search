@@ -38,12 +38,14 @@ class TestChapterRetrieval:
             chapters_dir,
             "What do platforms do over time?",
             record["chapters"],
+            book_id="sample",
             current_chapter=2,
             limit=3,
             min_word_count=5,
         )
         assert snippets
         assert int(snippets[0]["chapter_index"]) == 2
+        assert str(snippets[0]["chunk_id"]).startswith("sample:ch")
 
     def test_spoiler_guard_excludes_later_chapters(self, tmp_path: Path) -> None:
         record, chapters_dir = _ingest_sample(tmp_path)
@@ -51,6 +53,7 @@ class TestChapterRetrieval:
             chapters_dir,
             "regulation antitrust interoperability",
             record["chapters"],
+            book_id="sample",
             max_chapter=2,
             limit=6,
             min_word_count=5,
@@ -64,6 +67,7 @@ class TestChapterRetrieval:
             chapters_dir,
             "welcome introduction",
             record["chapters"],
+            book_id="sample",
             limit=2,
             min_word_count=5,
         )

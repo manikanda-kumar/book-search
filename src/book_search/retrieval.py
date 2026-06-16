@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .citations import format_sources, make_chunk_id
 from .util import normalize_whitespace, split_markdown_paragraphs
 
 
@@ -60,22 +61,30 @@ def retrieve_chapter_snippets(
     question: str,
     chapters: list[dict] | None = None,
     *,
+    book_id: str | None = None,
     current_chapter: int | None = None,
     max_chapter: int | None = None,
     limit: int = 6,
     min_word_count: int = 30,
-) -> list[dict[str, str | int]]:
+) -> list[dict]:
     query_tokens = _tokenize(question)
     chapter_meta = _chapter_meta_by_file(chapters or [])
-    chunks = _iter_chapter_chunks(chapters_dir, chapter_meta, max_chapter=max_chapter)
+    resolved_book_id = book_id or "book"
+    chunks = _iter_chapter_chunks(
+        chapters_dir,
+        chapter_meta,
+        book_id=resolved_book_id,
+        max_chapter=max_chapter,
+    )
 
-    scored: list[tuple[int, dict[str, str | int]]] = []
+    scored: list[tuple[int, dict]] = []
     for chunk in chunks:
         if int(chunk.get("word_count", 0)) < min_word_count and _is_front_matter(chunk):
             continue
         score = _score_chunk(chunk, question, query_tokens, current_chapter=current_chapter)
         if score <= 0:
             continue
+        chunk["retrieval_score"] = score
         scored.append((score, chunk))
 
     scored.sort(
@@ -83,7 +92,7 @@ def retrieve_chapter_snippets(
             -item[0],
             int(item[1]["chapter_index"]),
             str(item[1]["file"]),
-            str(item[1]["heading"]),
+            int(item[1]["chunk_index"]),
         )
     )
 
@@ -98,21 +107,44 @@ def retrieve_chapter_snippets(
                 key=lambda chunk: (
                     abs(int(chunk["chapter_index"]) - current_chapter),
                     int(chunk["chapter_index"]),
+                    int(chunk["chunk_index"]),
                 )
             )
         return fallbacks[:limit]
 
-    snippets: list[dict[str, str | int]] = []
-    seen: set[tuple[str, str]] = set()
+    snippets: list[dict] = []
+    seen: set[str] = set()
     for _score, chunk in scored:
-        key = (str(chunk["file"]), str(chunk["heading"]))
-        if key in seen:
+        chunk_id = str(chunk["chunk_id"])
+        if chunk_id in seen:
             continue
-        seen.add(key)
+        seen.add(chunk_id)
         snippets.append(chunk)
         if len(snippets) >= limit:
             break
     return snippets
+
+
+def search_chapters(
+    chapters_dir: Path,
+    query: str,
+    chapters: list[dict] | None = None,
+    *,
+    book_id: str | None = None,
+    current_chapter: int | None = None,
+    max_chapter: int | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    return retrieve_chapter_snippets(
+        chapters_dir,
+        query,
+        chapters,
+        book_id=book_id,
+        current_chapter=current_chapter,
+        max_chapter=max_chapter,
+        limit=limit,
+        min_word_count=0,
+    )
 
 
 def _chapter_meta_by_file(chapters: list[dict]) -> dict[str, dict]:
@@ -129,9 +161,10 @@ def _iter_chapter_chunks(
     chapters_dir: Path,
     chapter_meta: dict[str, dict],
     *,
+    book_id: str,
     max_chapter: int | None,
-) -> list[dict[str, str | int]]:
-    chunks: list[dict[str, str | int]] = []
+) -> list[dict]:
+    chunks: list[dict] = []
     for path in sorted(chapters_dir.glob("*.md")):
         meta = chapter_meta.get(path.name, {})
         chapter_index = int(meta.get("index", _index_from_filename(path.name)))
@@ -141,12 +174,14 @@ def _iter_chapter_chunks(
         text = path.read_text(encoding="utf-8")
         chapter_title = str(meta.get("title", path.stem))
         word_count = int(meta.get("word_count", len(text.split())))
-        for chunk in _split_markdown_file(path, text):
+        for chunk_index, chunk in enumerate(_split_markdown_file(path, text), start=1):
             chunk.update(
                 {
                     "chapter_index": chapter_index,
                     "chapter_title": chapter_title,
                     "word_count": word_count,
+                    "chunk_index": chunk_index,
+                    "chunk_id": make_chunk_id(book_id, chapter_index, chunk_index),
                 }
             )
             chunks.append(chunk)
@@ -160,12 +195,12 @@ def _index_from_filename(file_name: str) -> int:
     return 0
 
 
-def _is_front_matter(chunk: dict[str, str | int]) -> bool:
+def _is_front_matter(chunk: dict) -> bool:
     title = str(chunk.get("chapter_title", "")).strip().lower()
     return title in FRONT_MATTER_TITLES
 
 
-def _split_markdown_file(path: Path, text: str) -> list[dict[str, str]]:
+def _split_markdown_file(path: Path, text: str) -> list[dict]:
     sections: list[tuple[str, str]] = []
     current_heading = path.name
     buffer: list[str] = []
@@ -185,43 +220,59 @@ def _split_markdown_file(path: Path, text: str) -> list[dict[str, str]]:
     if not sections:
         sections.append((path.name, text.strip()))
 
-    chunks: list[dict[str, str]] = []
+    chunks: list[dict] = []
     for heading, section_text in sections:
         paragraphs = split_markdown_paragraphs(section_text) or [section_text]
         current_parts: list[str] = []
         current_length = 0
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-            projected = current_length + len(paragraph)
-            if current_parts and projected > 1200:
-                chunks.append(
-                    {
-                        "file": path.name,
-                        "heading": heading,
-                        "text": "\n\n".join(current_parts).strip(),
-                    }
-                )
-                current_parts = []
-                current_length = 0
-            current_parts.append(paragraph)
-            current_length += len(paragraph)
+        section_cursor = 0
 
-        if current_parts:
+        def flush_chunk(parts: list[str], start: int, end: int) -> None:
+            if not parts:
+                return
+            chunk_text = "\n\n".join(parts).strip()
             chunks.append(
                 {
                     "file": path.name,
                     "heading": heading,
-                    "text": "\n\n".join(current_parts).strip(),
+                    "text": chunk_text,
+                    "char_start": start,
+                    "char_end": end,
                 }
             )
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+
+            paragraph_start = section_text.find(paragraph, section_cursor)
+            if paragraph_start < 0:
+                paragraph_start = section_cursor
+            paragraph_end = paragraph_start + len(paragraph)
+
+            projected = current_length + len(paragraph)
+            if current_parts and projected > 1200:
+                flush_chunk(current_parts, section_cursor, paragraph_start)
+                current_parts = []
+                current_length = 0
+                section_cursor = paragraph_start
+
+            if not current_parts:
+                section_cursor = paragraph_start
+
+            current_parts.append(paragraph)
+            current_length += len(paragraph)
+            section_cursor = paragraph_end
+
+        if current_parts:
+            flush_chunk(current_parts, section_cursor - current_length, section_cursor)
 
     return [chunk for chunk in chunks if chunk["text"]]
 
 
 def _score_chunk(
-    chunk: dict[str, str | int],
+    chunk: dict,
     question: str,
     query_tokens: set[str],
     *,
@@ -273,20 +324,4 @@ def _tokenize(text: str) -> set[str]:
     }
 
 
-def format_sources(snippets: list[dict[str, str | int]]) -> list[dict[str, str | int]]:
-    sources: list[dict[str, str | int]] = []
-    seen: set[int] = set()
-    for snippet in snippets:
-        chapter_index = int(snippet.get("chapter_index", 0))
-        if chapter_index in seen:
-            continue
-        seen.add(chapter_index)
-        sources.append(
-            {
-                "chapter_index": chapter_index,
-                "chapter_title": str(snippet.get("chapter_title", "")),
-                "file": str(snippet.get("file", "")),
-                "heading": str(snippet.get("heading", "")),
-            }
-        )
-    return sources
+__all__ = ["retrieve_chapter_snippets", "search_chapters", "format_sources", "FRONT_MATTER_TITLES"]

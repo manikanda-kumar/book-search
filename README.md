@@ -48,24 +48,41 @@ Show book details:
 book-search show my-book-id
 ```
 
+List chapters:
+
+```bash
+book-search chapters enshittification-cory-doctorow
+```
+
+Search without an LLM:
+
+```bash
+book-search search enshittification-cory-doctorow "enshittification" --chapter 7 --spoiler 7
+```
+
 Ask a one-shot question:
 
 ```bash
-book-search ask enshittification-cory-doctorow "What is enshittification?" --chapter 7
-
-# try another free OpenRouter model
 book-search ask enshittification-cory-doctorow "What is enshittification?" \
-  --chapter 7 --model minimax/minimax-m2.5
+  --chapter 7 --spoiler 7 --show-sources
 ```
 
 Interactive companion (set chapter as you read):
 
 ```bash
-book-search chat enshittification-cory-doctorow --chapter 7 --spoiler 7 \
-  --model moonshotai/kimi-k2.6
+book-search chat enshittification-cory-doctorow --chapter 7 --spoiler 7 --show-sources
 ```
 
-Chat commands: `/chapter N`, `/spoiler N`, `/chapters`, `/clear`, `/quit`
+Persist reading position:
+
+```bash
+book-search position enshittification-cory-doctorow set 7 --spoiler 7
+book-search position enshittification-cory-doctorow show
+```
+
+Chat commands: `/chapter N`, `/spoiler N`, `/sources`, `/chapters`, `/clear`, `/quit`
+
+Retrieved chunks use stable ids like `book-id:ch007:c001` and are shown independently of model prose.
 
 ## Data layout
 
@@ -83,6 +100,8 @@ data/books/<book-id>/
 - [x] EPUB ingestion with chapter markdown
 - [x] Companion chat CLI (chapter-aware retrieval)
 - [x] Reading position + spoiler guard
+- [x] Stable chunk IDs + auditable `--show-sources`
+- [x] `chapters`, `search`, `position` CLI commands
 - [ ] Integrated reader UI
 - [ ] PDF support
 - [ ] Author persona layer
