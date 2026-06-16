@@ -7,6 +7,7 @@ from zipfile import ZipFile, is_zipfile
 
 from ..calibre import read_ebook_meta
 from ..chapters import classify_chapter, content_start_chapter, enrich_book_chapters
+from ..ingest_warnings import collect_extraction_warnings, source_fingerprint
 from ..paths import BookPaths
 from ..util import ensure_dir, excerpt, local_name, markdown_code_block, normalize_whitespace, slugify, utc_now, word_count, write_text
 
@@ -272,7 +273,7 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
     resolved_language = languages[0] if languages else None
     resolved_identifier = calibre_metadata.get("primary_identifier") or native_metadata["identifier"]
 
-    return {
+    record = {
         "book_id": paths.book_dir.name,
         "title": resolved_title,
         "author": resolved_author,
@@ -287,6 +288,7 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
         "tags": calibre_metadata.get("tags") or [],
         "source_format": "epub",
         "source_path": str(source_path.relative_to(paths.root)),
+        "source_fingerprint": source_fingerprint(source_path),
         "extracted_at": utc_now(),
         "combined_markdown_path": str(combined_path.relative_to(paths.root)),
         "chapter_count": len(chapters),
@@ -298,3 +300,5 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
         },
         "calibre": calibre,
     }
+    record["extraction_warnings"] = collect_extraction_warnings(record)
+    return record

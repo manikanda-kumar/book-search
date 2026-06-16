@@ -7,6 +7,7 @@ import zipfile
 def make_minimal_epub(
     title: str = "Sample Book",
     author: str = "Jane Author",
+    identifier: str = "sample-book-uid",
     chapters: list[tuple[str, str]] | None = None,
 ) -> bytes:
     if chapters is None:
@@ -54,7 +55,7 @@ def make_minimal_epub(
     <dc:title>{title}</dc:title>
     <dc:creator>{author}</dc:creator>
     <dc:language>en</dc:language>
-    <dc:identifier id="uid">sample-book-uid</dc:identifier>
+    <dc:identifier id="uid">{identifier}</dc:identifier>
   </metadata>
   <manifest>
     {''.join(manifest_items)}

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .chapters import content_start_chapter, enrich_book_chapters
 from .extractors import extract_book
+from .ingest_warnings import find_identifier_conflict
 from .paths import BookPaths, book_paths, books_root
 from .util import ensure_dir, read_json, slugify, write_json
 
@@ -51,6 +52,7 @@ def ingest_source(
             shutil.copy2(resolved, destination)
 
         record = extract_book(destination, paths)
+        _guard_duplicate_identifier(inferred_id, record, workspace)
         write_json(paths.book_record_path, record)
         return inferred_id, record, paths
     except Exception:
@@ -67,6 +69,37 @@ def load_book_record(book_id: str, workspace: Path | None = None) -> tuple[dict,
     if not isinstance(record, dict):
         raise ValueError(f"Invalid book record for `{book_id}`.")
     return _normalize_record(record), paths
+
+
+def delete_book(book_id: str, workspace: Path | None = None) -> BookPaths:
+    paths = book_paths(book_id, workspace)
+    if not paths.book_dir.exists():
+        raise FileNotFoundError(f"Book `{book_id}` has not been ingested yet.")
+    shutil.rmtree(paths.book_dir)
+    return paths
+
+
+def _guard_duplicate_identifier(book_id: str, record: dict, workspace: Path | None) -> None:
+    identifier = record.get("identifier")
+    if not identifier:
+        return
+
+    existing: list[dict] = []
+    for item in list_books(workspace):
+        if item["book_id"] == book_id:
+            continue
+        try:
+            existing_record, _paths = load_book_record(item["book_id"], workspace)
+        except (FileNotFoundError, ValueError):
+            continue
+        existing.append(existing_record)
+
+    conflict = find_identifier_conflict(identifier, exclude_book_id=book_id, books=existing)
+    if conflict:
+        raise ValueError(
+            f"Identifier `{identifier}` is already used by book `{conflict}`. "
+            "Delete the existing book or use a different source."
+        )
 
 
 def list_books(workspace: Path | None = None) -> list[dict[str, str]]:

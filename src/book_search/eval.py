@@ -3,18 +3,59 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
 from .chapters import content_start_chapter, enrich_book_chapters
-from .companion import answer_question
+from .eval_fixtures import build_standard_eval_book, build_watermark_eval_book
 from .llm import LlmConfigError, complete_chat
-from .paths import book_paths
-from .pipeline import load_book_record
-from .retrieval import retrieve_chapter_snippets
-from .spoiler import build_spoiler_blocked_response, resolve_spoiler_limits, spoiler_refusal_message
+from .pipeline import ingest_source
+from .retrieval import retrieve_chapter_snippets, search_chapters
+from .spoiler import build_spoiler_blocked_response, resolve_spoiler_limits
+from .testdata import make_minimal_epub
 
 
 DEFAULT_JUDGE_MODEL = "minimax/minimax-m2.5"
+
+JUDGE_PROMPTS: dict[str, str] = {
+    "spoiler": """You are a strict QA judge for a book-reading companion product.
+Review deterministic eval results for spoiler-guard semantics.
+Return JSON only with keys:
+- overall_pass: boolean
+- score: number from 0 to 100
+- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
+- summary: string
+Be concrete. Fail the review if spoiler refusal behavior is weak or ambiguous.""",
+    "retrieval": """You are a strict QA judge for a book-reading companion product.
+Review deterministic eval results for chapter-aware lexical retrieval.
+Return JSON only with keys:
+- overall_pass: boolean
+- score: number from 0 to 100
+- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
+- summary: string
+Be concrete. Fail the review if retrieval does not respect chapter bias, spoiler limits, or chunk id stability.""",
+    "ingestion": """You are a strict QA judge for a book-reading companion product.
+Review deterministic eval results for EPUB ingestion diagnostics and duplicate detection.
+Return JSON only with keys:
+- overall_pass: boolean
+- score: number from 0 to 100
+- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
+- summary: string
+Be concrete. Fail the review if extraction warnings or duplicate guards are missing or weak.""",
+    "all": """You are a strict QA judge for a book-reading companion product.
+Review aggregated eval results across spoiler, retrieval, and ingestion suites.
+Return JSON only with keys:
+- overall_pass: boolean
+- score: number from 0 to 100
+- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
+- summary: string
+Be concrete. Fail if any suite has critical gaps for a trustworthy reading companion.""",
+}
+
+JUDGE_USER_TEMPLATES: dict[str, str] = {
+    "spoiler": "Review this eval report for Oracle recommendation #2 (spoiler guard semantics).\n\n{payload}",
+    "retrieval": "Review this eval report for Oracle recommendation #3 (product-level retrieval evals).\n\n{payload}",
+    "ingestion": "Review this eval report for P1 ingestion reliability (warnings and duplicate detection).\n\n{payload}",
+    "all": "Review this aggregated eval report across all product suites.\n\n{payload}",
+}
 
 
 @dataclass(frozen=True)
@@ -34,31 +75,8 @@ class EvalResult:
 
 
 def run_spoiler_eval(workspace: Path | None = None) -> list[EvalResult]:
-    from .extractors.epub import extract_epub
-    from .testdata import make_minimal_epub
-
     tmp_root = _eval_workspace(workspace)
-    (tmp_root / "pyproject.toml").touch()
-    epub_path = tmp_root / "eval-book.epub"
-    epub_path.write_bytes(
-        make_minimal_epub(
-            title="Eval Book",
-            chapters=[
-                ("Cover", "<h1>Cover</h1><p>OceanofPDF.com</p>"),
-                ("Introduction", "<h1>Introduction</h1><p>Alice founded the platform in 2010.</p>"),
-                (
-                    "Platforms",
-                    "<h1>Platforms</h1><p>Platforms first serve users, then business customers, then only themselves.</p>",
-                ),
-                (
-                    "Regulation",
-                    "<h1>Regulation</h1><p>Antitrust and interoperability can reverse platform decay.</p>",
-                ),
-            ],
-        )
-    )
-    paths = book_paths("eval-book", tmp_root)
-    record = extract_epub(epub_path, paths)
+    record, paths = build_standard_eval_book(tmp_root)
 
     results: list[EvalResult] = []
     results.append(_eval_auto_link_spoiler(record, paths))
@@ -69,30 +87,63 @@ def run_spoiler_eval(workspace: Path | None = None) -> list[EvalResult]:
     return results
 
 
+def run_retrieval_eval(workspace: Path | None = None) -> list[EvalResult]:
+    tmp_root = _eval_workspace(workspace)
+    record, paths = build_standard_eval_book(tmp_root)
+    chapters = record["chapters"]
+    chapters_dir = paths.chapters_dir
+    book_id = "eval-book"
+
+    results: list[EvalResult] = []
+    results.append(_eval_summarize_chapter_prefers_target(record, chapters_dir, chapters, book_id))
+    results.append(_eval_character_introduction(record, chapters_dir, chapters, book_id))
+    results.append(_eval_spoiler_retrieval_excludes_later(record, chapters_dir, chapters, book_id))
+    results.append(_eval_themes_respect_spoiler(record, chapters_dir, chapters, book_id))
+    results.append(_eval_chapter_boost_predictable(record, chapters_dir, chapters, book_id))
+    results.append(_eval_search_returns_chunk_ids(record, chapters_dir, chapters, book_id))
+    results.append(_eval_later_answer_blocked(record, paths))
+    return results
+
+
+def run_ingestion_eval(workspace: Path | None = None) -> list[EvalResult]:
+    tmp_root = _eval_workspace(workspace)
+
+    results: list[EvalResult] = []
+    results.append(_eval_watermark_warnings(tmp_root))
+    results.append(_eval_warnings_stored_on_record(tmp_root))
+    results.append(_eval_content_start_detected(tmp_root))
+    results.append(_eval_duplicate_identifier_guard(tmp_root))
+    return results
+
+
+def run_all_evals(workspace: Path | None = None) -> dict[str, list[EvalResult]]:
+    return {
+        "spoiler": run_spoiler_eval(workspace),
+        "retrieval": run_retrieval_eval(workspace),
+        "ingestion": run_ingestion_eval(workspace),
+    }
+
+
 def judge_eval_results(
     results: list[EvalResult],
     *,
     suite: str,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     implementation_notes: str = "",
+    extra_payload: dict | None = None,
 ) -> dict:
     payload = {
         "suite": suite,
         "results": [asdict(result) for result in results],
         "implementation_notes": implementation_notes,
     }
-    system = """You are a strict QA judge for a book-reading companion product.
-Review deterministic eval results for spoiler-guard semantics.
-Return JSON only with keys:
-- overall_pass: boolean
-- score: number from 0 to 100
-- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
-- summary: string
-Be concrete. Fail the review if spoiler refusal behavior is weak or ambiguous."""
-    user = (
-        "Review this eval report for Oracle recommendation #2 (spoiler guard semantics).\n\n"
-        f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
-    )
+    if extra_payload:
+        payload.update(extra_payload)
+
+    system = JUDGE_PROMPTS.get(suite, JUDGE_PROMPTS["all"])
+    user_template = JUDGE_USER_TEMPLATES.get(suite, JUDGE_USER_TEMPLATES["all"])
+    user = user_template.format(payload=json.dumps(payload, indent=2, ensure_ascii=False))
+
     try:
         raw, model = complete_chat(system=system, user=user, model=judge_model, max_tokens=1200)
     except LlmConfigError as error:
@@ -109,6 +160,251 @@ Be concrete. Fail the review if spoiler refusal behavior is weak or ambiguous.""
     parsed["judge_model"] = model
     parsed["raw"] = raw
     return parsed
+
+
+def _eval_summarize_chapter_prefers_target(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = retrieve_chapter_snippets(
+        chapters_dir,
+        "summarize platforms business customers users",
+        chapters,
+        book_id=book_id,
+        current_chapter=3,
+        limit=3,
+        min_word_count=5,
+    )
+    top_chapter = int(snippets[0]["chapter_index"]) if snippets else None
+    passed = bool(snippets) and top_chapter == 3
+    return EvalResult(
+        id="summarize_chapter_prefers_target",
+        description="Summarize-style query with current chapter bias prefers that chapter",
+        passed=passed,
+        details=f"top_chapter={top_chapter} indexes={[item['chapter_index'] for item in snippets]}",
+        evidence={"top_chapter": top_chapter, "chapter_indexes": [item["chapter_index"] for item in snippets]},
+    )
+
+
+def _eval_character_introduction(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = retrieve_chapter_snippets(
+        chapters_dir,
+        "Who is Alice?",
+        chapters,
+        book_id=book_id,
+        limit=3,
+        min_word_count=5,
+    )
+    top_chapter = int(snippets[0]["chapter_index"]) if snippets else None
+    has_alice = bool(snippets) and "Alice" in str(snippets[0]["text"])
+    passed = top_chapter == 2 and has_alice
+    return EvalResult(
+        id="character_introduction",
+        description="Character introduction query retrieves the introduction chapter",
+        passed=passed,
+        details=f"top_chapter={top_chapter} has_alice={has_alice}",
+        evidence={"top_chapter": top_chapter, "text": snippets[0]["text"] if snippets else ""},
+    )
+
+
+def _eval_spoiler_retrieval_excludes_later(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = retrieve_chapter_snippets(
+        chapters_dir,
+        "antitrust interoperability regulation",
+        chapters,
+        book_id=book_id,
+        max_chapter=3,
+        limit=10,
+        min_word_count=5,
+    )
+    indexes = [int(item["chapter_index"]) for item in snippets]
+    passed = bool(snippets) and all(index <= 3 for index in indexes)
+    passed = passed and all("antitrust" not in str(item["text"]).lower() for item in snippets)
+    return EvalResult(
+        id="spoiler_retrieval_excludes_later",
+        description="Retrieval under spoiler guard excludes later chapters",
+        passed=passed,
+        details=f"chapter_indexes={indexes}",
+        evidence={"chapter_indexes": indexes},
+    )
+
+
+def _eval_themes_respect_spoiler(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = retrieve_chapter_snippets(
+        chapters_dir,
+        "recurring themes platform decay regulation antitrust",
+        chapters,
+        book_id=book_id,
+        max_chapter=3,
+        limit=6,
+        min_word_count=5,
+    )
+    indexes = [int(item["chapter_index"]) for item in snippets]
+    passed = bool(snippets) and all(index <= 3 for index in indexes)
+    return EvalResult(
+        id="themes_respect_spoiler",
+        description="Themes-so-far query respects spoiler chapter limit",
+        passed=passed,
+        details=f"chapter_indexes={indexes}",
+        evidence={"chapter_indexes": indexes},
+    )
+
+
+def _eval_chapter_boost_predictable(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = retrieve_chapter_snippets(
+        chapters_dir,
+        "platforms business customers users",
+        chapters,
+        book_id=book_id,
+        current_chapter=3,
+        limit=3,
+        min_word_count=5,
+    )
+    top_chapter = int(snippets[0]["chapter_index"]) if snippets else None
+    passed = top_chapter == 3
+    return EvalResult(
+        id="chapter_boost_predictable",
+        description="Current-chapter retrieval boost ranks the active chapter first",
+        passed=passed,
+        details=f"top_chapter={top_chapter}",
+        evidence={"top_chapter": top_chapter},
+    )
+
+
+def _eval_search_returns_chunk_ids(
+    record: dict,
+    chapters_dir: Path,
+    chapters: list[dict],
+    book_id: str,
+) -> EvalResult:
+    snippets = search_chapters(
+        chapters_dir,
+        "platform decay",
+        chapters,
+        book_id=book_id,
+        limit=5,
+    )
+    passed = bool(snippets) and all("chunk_id" in item for item in snippets)
+    passed = passed and snippets[0]["chunk_id"].startswith(f"{book_id}:ch")
+    return EvalResult(
+        id="search_returns_chunk_ids",
+        description="Search results include stable chunk ids",
+        passed=passed,
+        details=f"chunk_ids={[item.get('chunk_id') for item in snippets]}",
+        evidence={"chunk_ids": [item.get("chunk_id") for item in snippets]},
+    )
+
+
+def _eval_later_answer_blocked(record: dict, paths) -> EvalResult:
+    limits = resolve_spoiler_limits(current_chapter=3, max_chapter=3, auto_spoiler=False)
+    response = build_spoiler_blocked_response(
+        "antitrust interoperability regulation",
+        paths.chapters_dir,
+        record["chapters"],
+        book_id="eval-book",
+        limits=limits,
+    )
+    passed = (
+        response is not None
+        and response.get("spoiler_blocked") is True
+        and response.get("later_match") is True
+        and "yet without spoilers" in response.get("answer", "")
+    )
+    return EvalResult(
+        id="later_answer_blocked",
+        description="Question answerable only in later chapters triggers spoiler refusal",
+        passed=passed,
+        details=response.get("answer", "") if response else "no response",
+        evidence=response or {},
+    )
+
+
+def _eval_watermark_warnings(workspace: Path) -> EvalResult:
+    record, _paths = build_watermark_eval_book(workspace)
+    warnings = record.get("extraction_warnings", [])
+    passed = isinstance(warnings, list) and any("watermark" in warning.lower() for warning in warnings)
+    return EvalResult(
+        id="watermark_warnings",
+        description="Watermark-like text triggers extraction warnings",
+        passed=passed,
+        details=str(warnings),
+        evidence={"warnings": warnings},
+    )
+
+
+def _eval_warnings_stored_on_record(workspace: Path) -> EvalResult:
+    record, _paths = build_standard_eval_book(workspace)
+    warnings = record.get("extraction_warnings")
+    passed = isinstance(warnings, list)
+    return EvalResult(
+        id="warnings_stored_on_record",
+        description="Extraction warnings are stored on the book record",
+        passed=passed,
+        details=str(warnings),
+        evidence={"warnings": warnings},
+    )
+
+
+def _eval_content_start_detected(workspace: Path) -> EvalResult:
+    record, _paths = build_watermark_eval_book(workspace)
+    start = record.get("content_start_chapter")
+    passed = start == 3
+    return EvalResult(
+        id="content_start_detected",
+        description="Content start chapter is detected after front matter",
+        passed=passed,
+        details=f"content_start_chapter={start}",
+        evidence={"content_start_chapter": start},
+    )
+
+
+def _eval_duplicate_identifier_guard(workspace: Path) -> EvalResult:
+    (workspace / "pyproject.toml").touch()
+    first_epub = workspace / "dup-a.epub"
+    second_epub = workspace / "dup-b.epub"
+    shared_identifier = "shared-eval-identifier"
+    first_epub.write_bytes(make_minimal_epub(title="Dup A", identifier=shared_identifier))
+    second_epub.write_bytes(make_minimal_epub(title="Dup B", identifier=shared_identifier))
+
+    ingest_source(first_epub, book_id="dup-a", workspace=workspace)
+    conflict_raised = False
+    message = ""
+    try:
+        ingest_source(second_epub, book_id="dup-b", workspace=workspace)
+    except ValueError as error:
+        conflict_raised = True
+        message = str(error)
+
+    passed = conflict_raised and "dup-a" in message
+    return EvalResult(
+        id="duplicate_identifier_guard",
+        description="Ingest refuses a second book with the same identifier",
+        passed=passed,
+        details=message or "no conflict raised",
+        evidence={"conflict_raised": conflict_raised, "message": message},
+    )
 
 
 def _eval_auto_link_spoiler(record: dict, paths) -> EvalResult:

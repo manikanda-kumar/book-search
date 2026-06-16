@@ -8,9 +8,18 @@ from pathlib import Path
 from .citations import print_sources
 from .companion import CompanionError, answer_question, chat_loop, set_reading_position
 from .llm import RECOMMENDED_MODELS
-from .pipeline import ingest_source, list_books, load_book_record
+from .doctor import doctor_has_failures, run_doctor
+from .pipeline import delete_book, ingest_source, list_books, load_book_record
 from .paths import WorkspaceDiscoveryError
-from .eval import DEFAULT_JUDGE_MODEL, judge_eval_results, run_spoiler_eval
+from .eval import (
+    DEFAULT_JUDGE_MODEL,
+    EvalResult,
+    judge_eval_results,
+    run_all_evals,
+    run_ingestion_eval,
+    run_retrieval_eval,
+    run_spoiler_eval,
+)
 from .retrieval import search_chapters
 
 
@@ -85,11 +94,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("models", help="List recommended chat models")
 
+    subparsers.add_parser("doctor", help="Validate workspace, dependencies, and ingested books")
+
+    delete = subparsers.add_parser("delete", help="Remove an ingested book from the workspace")
+    delete.add_argument("book_id", help="Previously ingested book id")
+
     eval_cmd = subparsers.add_parser("eval", help="Run product eval suites")
     eval_sub = eval_cmd.add_subparsers(dest="eval_command", required=True)
-    spoiler_eval = eval_sub.add_parser("spoiler", help="Run spoiler-guard eval suite")
-    spoiler_eval.add_argument("--judge-model", default=None, help="Optional LLM judge model slug")
-    spoiler_eval.add_argument("--json", action="store_true", help="Print machine-readable output")
+    for suite_name, help_text in (
+        ("spoiler", "Run spoiler-guard eval suite"),
+        ("retrieval", "Run retrieval eval suite"),
+        ("ingestion", "Run ingestion diagnostics eval suite"),
+        ("all", "Run all eval suites"),
+    ):
+        suite_parser = eval_sub.add_parser(suite_name, help=help_text)
+        suite_parser.add_argument(
+            "--judge-model",
+            default=DEFAULT_JUDGE_MODEL,
+            help="LLM judge model slug (use --no-judge to skip)",
+        )
+        suite_parser.add_argument("--no-judge", action="store_true", help="Skip LLM judge review")
+        suite_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
 
     return parser
 
@@ -100,7 +125,13 @@ def _print_chapter_list(record: dict) -> None:
         print("No chapters found.")
         return
     if record.get("content_start_chapter"):
-        print(f"Content starts at chapter {record['content_start_chapter']}\n")
+        print(f"Content starts at chapter {record['content_start_chapter']}")
+    warnings = record.get("extraction_warnings") or []
+    if warnings:
+        print(f"Extraction warnings: {len(warnings)}")
+        for warning in warnings[:3]:
+            print(f"  • {warning}")
+    print()
     for chapter in chapters:
         if not isinstance(chapter, dict):
             continue
@@ -111,6 +142,84 @@ def _print_chapter_list(record: dict) -> None:
             f"{str(chapter.get('title', '?'))[:50]:50s}  "
             f"{int(chapter.get('word_count', 0)):>6,} words"
         )
+
+
+def _build_eval_report(suite: str, results: list[EvalResult]) -> dict:
+    passed = sum(1 for item in results if item.passed)
+    return {
+        "suite": suite,
+        "passed": passed,
+        "total": len(results),
+        "results": [
+            {
+                "id": item.id,
+                "description": item.description,
+                "passed": item.passed,
+                "details": item.details,
+            }
+            for item in results
+        ],
+    }
+
+
+def _print_eval_report(
+    report: dict,
+    *,
+    json_output: bool,
+    judge: dict | None,
+    judge_model: str | None,
+) -> None:
+    if json_output:
+        if judge:
+            report["judge"] = judge
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    suite = report.get("suite", "eval")
+    passed = report.get("passed", 0)
+    total = report.get("total", 0)
+    print(f"{suite.title()} eval: {passed}/{total} passed\n")
+    for item in report.get("results", []):
+        status = "PASS" if item.get("passed") else "FAIL"
+        print(f"  [{status}] {item.get('id')}: {item.get('description')}")
+        if not item.get("passed"):
+            print(f"         {item.get('details')}")
+    if judge:
+        print("\nLLM judge:")
+        print(f"  model: {judge.get('judge_model', judge_model)}")
+        print(f"  overall_pass: {judge.get('overall_pass')}")
+        print(f"  score: {judge.get('score')}")
+        print(f"  summary: {judge.get('summary', '')}")
+        for finding in judge.get("findings", [])[:5]:
+            if isinstance(finding, dict):
+                print(
+                    f"  - [{finding.get('severity', '?')}] "
+                    f"{finding.get('issue', '')} -> {finding.get('recommendation', '')}"
+                )
+
+
+def _run_eval_suite(
+    suite: str,
+    results: list[EvalResult],
+    *,
+    judge_model: str | None,
+    no_judge: bool,
+    json_output: bool,
+    implementation_notes: str,
+    extra_judge_payload: dict | None = None,
+) -> int:
+    report = _build_eval_report(suite, results)
+    judge = None
+    if not no_judge and judge_model:
+        judge = judge_eval_results(
+            results,
+            suite=suite,
+            judge_model=judge_model,
+            implementation_notes=implementation_notes,
+            extra_payload=extra_judge_payload,
+        )
+    _print_eval_report(report, json_output=json_output, judge=judge, judge_model=judge_model)
+    return 0 if report["passed"] == report["total"] else 1
 
 
 def _print_ask_sources(result: dict, *, show_sources: bool) -> None:
@@ -145,6 +254,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Author: {record['author']}")
             print(f"Chapters: {record['chapter_count']}")
             print(f"Data: {paths.book_dir}")
+            warnings = record.get("extraction_warnings") or []
+            if warnings:
+                print(f"Warnings ({len(warnings)}):")
+                for warning in warnings[:5]:
+                    print(f"  • {warning}")
             return 0
 
         if args.command == "models":
@@ -221,58 +335,98 @@ def main(argv: list[str] | None = None) -> int:
             parser.parse_args(["position", "--help"])
             return 0
 
+        if args.command == "doctor":
+            checks = run_doctor(workspace)
+            for check in checks:
+                label = check.status.upper()
+                print(f"  [{label}] {check.id}: {check.message}")
+            return 1 if doctor_has_failures(checks) else 0
+
+        if args.command == "delete":
+            paths = delete_book(args.book_id, workspace)
+            print(f"Deleted book `{args.book_id}` from {paths.book_dir.parent}")
+            return 0
+
         if args.command == "eval":
+            eval_notes = {
+                "spoiler": (
+                    "Oracle #2: auto-link spoiler to current chapter, informed refusal, "
+                    "front matter classification, retrieval exclusion."
+                ),
+                "retrieval": (
+                    "Oracle #3: chapter bias, character intro, spoiler limits, themes-so-far, "
+                    "chunk ids, later-answer refusal."
+                ),
+                "ingestion": (
+                    "P1: extraction warnings, content start detection, duplicate identifier guard."
+                ),
+                "all": "Aggregated spoiler, retrieval, and ingestion suites.",
+            }
             if args.eval_command == "spoiler":
-                results = run_spoiler_eval(workspace)
-                passed = sum(1 for item in results if item.passed)
+                return _run_eval_suite(
+                    "spoiler",
+                    run_spoiler_eval(workspace),
+                    judge_model=None if args.no_judge else args.judge_model,
+                    no_judge=args.no_judge,
+                    json_output=args.json,
+                    implementation_notes=eval_notes["spoiler"],
+                )
+            if args.eval_command == "retrieval":
+                return _run_eval_suite(
+                    "retrieval",
+                    run_retrieval_eval(workspace),
+                    judge_model=None if args.no_judge else args.judge_model,
+                    no_judge=args.no_judge,
+                    json_output=args.json,
+                    implementation_notes=eval_notes["retrieval"],
+                )
+            if args.eval_command == "ingestion":
+                return _run_eval_suite(
+                    "ingestion",
+                    run_ingestion_eval(workspace),
+                    judge_model=None if args.no_judge else args.judge_model,
+                    no_judge=args.no_judge,
+                    json_output=args.json,
+                    implementation_notes=eval_notes["ingestion"],
+                )
+            if args.eval_command == "all":
+                suites = run_all_evals(workspace)
+                all_results = [item for results in suites.values() for item in results]
+                passed = sum(1 for item in all_results if item.passed)
                 report = {
-                    "suite": "spoiler",
+                    "suite": "all",
                     "passed": passed,
-                    "total": len(results),
-                    "results": [
-                        {
-                            "id": item.id,
-                            "description": item.description,
-                            "passed": item.passed,
-                            "details": item.details,
-                        }
-                        for item in results
-                    ],
+                    "total": len(all_results),
+                    "suites": {name: _build_eval_report(name, results) for name, results in suites.items()},
                 }
                 judge = None
-                if args.judge_model:
+                if not args.no_judge and args.judge_model:
                     judge = judge_eval_results(
-                        results,
-                        suite="spoiler",
+                        all_results,
+                        suite="all",
                         judge_model=args.judge_model,
-                        implementation_notes=(
-                            "Oracle #2: auto-link spoiler to current chapter, informed refusal, "
-                            "front matter classification, retrieval exclusion."
-                        ),
+                        implementation_notes=eval_notes["all"],
+                        extra_payload={"suites": report["suites"]},
                     )
-                    report["judge"] = judge
                 if args.json:
+                    if judge:
+                        report["judge"] = judge
                     print(json.dumps(report, indent=2, ensure_ascii=False))
                 else:
-                    print(f"Spoiler eval: {passed}/{len(results)} passed\n")
-                    for item in results:
-                        status = "PASS" if item.passed else "FAIL"
-                        print(f"  [{status}] {item.id}: {item.description}")
-                        if not item.passed:
-                            print(f"         {item.details}")
+                    print(f"All evals: {passed}/{len(all_results)} passed\n")
+                    for name, results in suites.items():
+                        suite_passed = sum(1 for item in results if item.passed)
+                        print(f"{name.title()} ({suite_passed}/{len(results)})")
+                        for item in results:
+                            status = "PASS" if item.passed else "FAIL"
+                            print(f"  [{status}] {item.id}")
                     if judge:
                         print("\nLLM judge:")
                         print(f"  model: {judge.get('judge_model', args.judge_model)}")
                         print(f"  overall_pass: {judge.get('overall_pass')}")
                         print(f"  score: {judge.get('score')}")
                         print(f"  summary: {judge.get('summary', '')}")
-                        for finding in judge.get("findings", [])[:5]:
-                            if isinstance(finding, dict):
-                                print(
-                                    f"  - [{finding.get('severity', '?')}] "
-                                    f"{finding.get('issue', '')} -> {finding.get('recommendation', '')}"
-                                )
-                return 0 if passed == len(results) else 1
+                return 0 if passed == len(all_results) else 1
             return 1
 
         if args.command == "ask":
