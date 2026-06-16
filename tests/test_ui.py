@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from book_search.eval_fixtures import build_standard_eval_book
-from book_search.ui.handlers import api_book_summary, api_chapter_content, api_list_books, api_search
+from book_search.ui.handlers import (
+    api_book_summary,
+    api_chapter_content,
+    api_doctor,
+    api_list_books,
+    api_search,
+)
 from book_search.ui.markdown import render_markdown
 
 
@@ -39,3 +45,12 @@ class TestUiHandlers:
         payload = api_search("eval-book", query="Alice", workspace=tmp_path)
         assert payload["count"] >= 1
         assert "not semantic" in payload["note"]
+
+    def test_api_doctor_returns_status_cards(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").touch()
+        build_standard_eval_book(tmp_path)
+        checks = api_doctor(tmp_path)
+        assert checks
+        for check in checks:
+            assert {"id", "status", "message"} <= check.keys()
+            assert check["status"] in {"ok", "warn", "fail"}
