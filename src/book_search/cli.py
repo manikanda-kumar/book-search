@@ -10,6 +10,7 @@ from .companion import CompanionError, answer_question, chat_loop, set_reading_p
 from .llm import RECOMMENDED_MODELS
 from .pipeline import ingest_source, list_books, load_book_record
 from .paths import WorkspaceDiscoveryError
+from .eval import DEFAULT_JUDGE_MODEL, judge_eval_results, run_spoiler_eval
 from .retrieval import search_chapters
 
 
@@ -64,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--spoiler", type=int, help="Only use content up to this chapter")
     ask.add_argument("--model", help="Model slug (OpenRouter or OpenAI; see `book-search models`)")
     ask.add_argument("--show-sources", action="store_true", help="Print retrieved chunk excerpts")
+    ask.add_argument(
+        "--no-spoiler-auto",
+        action="store_true",
+        help="Do not auto-link spoiler guard to --chapter when --spoiler is omitted",
+    )
 
     chat = subparsers.add_parser("chat", help="Interactive reading companion")
     chat.add_argument("book_id", help="Previously ingested book id")
@@ -71,8 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--spoiler", type=int, help="Only use content up to this chapter")
     chat.add_argument("--model", help="Model slug (OpenRouter or OpenAI; see `book-search models`)")
     chat.add_argument("--show-sources", action="store_true", help="Always print retrieved chunk excerpts")
+    chat.add_argument(
+        "--no-spoiler-auto",
+        action="store_true",
+        help="Do not auto-link spoiler guard to --chapter when --spoiler is omitted",
+    )
 
     subparsers.add_parser("models", help="List recommended chat models")
+
+    eval_cmd = subparsers.add_parser("eval", help="Run product eval suites")
+    eval_sub = eval_cmd.add_subparsers(dest="eval_command", required=True)
+    spoiler_eval = eval_sub.add_parser("spoiler", help="Run spoiler-guard eval suite")
+    spoiler_eval.add_argument("--judge-model", default=None, help="Optional LLM judge model slug")
+    spoiler_eval.add_argument("--json", action="store_true", help="Print machine-readable output")
 
     return parser
 
@@ -82,12 +99,16 @@ def _print_chapter_list(record: dict) -> None:
     if not isinstance(chapters, list) or not chapters:
         print("No chapters found.")
         return
+    if record.get("content_start_chapter"):
+        print(f"Content starts at chapter {record['content_start_chapter']}\n")
     for chapter in chapters:
         if not isinstance(chapter, dict):
             continue
+        kind = str(chapter.get("kind", "body"))[:12]
         print(
             f"  {int(chapter.get('index', 0)):>3}  "
-            f"{str(chapter.get('title', '?'))[:60]:60s}  "
+            f"{kind:12s}  "
+            f"{str(chapter.get('title', '?'))[:50]:50s}  "
             f"{int(chapter.get('word_count', 0)):>6,} words"
         )
 
@@ -200,6 +221,60 @@ def main(argv: list[str] | None = None) -> int:
             parser.parse_args(["position", "--help"])
             return 0
 
+        if args.command == "eval":
+            if args.eval_command == "spoiler":
+                results = run_spoiler_eval(workspace)
+                passed = sum(1 for item in results if item.passed)
+                report = {
+                    "suite": "spoiler",
+                    "passed": passed,
+                    "total": len(results),
+                    "results": [
+                        {
+                            "id": item.id,
+                            "description": item.description,
+                            "passed": item.passed,
+                            "details": item.details,
+                        }
+                        for item in results
+                    ],
+                }
+                judge = None
+                if args.judge_model:
+                    judge = judge_eval_results(
+                        results,
+                        suite="spoiler",
+                        judge_model=args.judge_model,
+                        implementation_notes=(
+                            "Oracle #2: auto-link spoiler to current chapter, informed refusal, "
+                            "front matter classification, retrieval exclusion."
+                        ),
+                    )
+                    report["judge"] = judge
+                if args.json:
+                    print(json.dumps(report, indent=2, ensure_ascii=False))
+                else:
+                    print(f"Spoiler eval: {passed}/{len(results)} passed\n")
+                    for item in results:
+                        status = "PASS" if item.passed else "FAIL"
+                        print(f"  [{status}] {item.id}: {item.description}")
+                        if not item.passed:
+                            print(f"         {item.details}")
+                    if judge:
+                        print("\nLLM judge:")
+                        print(f"  model: {judge.get('judge_model', args.judge_model)}")
+                        print(f"  overall_pass: {judge.get('overall_pass')}")
+                        print(f"  score: {judge.get('score')}")
+                        print(f"  summary: {judge.get('summary', '')}")
+                        for finding in judge.get("findings", [])[:5]:
+                            if isinstance(finding, dict):
+                                print(
+                                    f"  - [{finding.get('severity', '?')}] "
+                                    f"{finding.get('issue', '')} -> {finding.get('recommendation', '')}"
+                                )
+                return 0 if passed == len(results) else 1
+            return 1
+
         if args.command == "ask":
             record, paths = load_book_record(args.book_id, workspace)
             result = answer_question(
@@ -208,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.question,
                 current_chapter=args.chapter,
                 max_chapter=args.spoiler,
+                auto_spoiler=not args.no_spoiler_auto,
                 model=args.model,
             )
             print(result["answer"])
@@ -221,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 paths,
                 current_chapter=args.chapter,
                 max_chapter=args.spoiler,
+                auto_spoiler=not args.no_spoiler_auto,
                 model=args.model,
                 show_sources=args.show_sources,
             )

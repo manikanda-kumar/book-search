@@ -12,6 +12,7 @@ from .citations import (
 from .llm import LlmConfigError, complete_chat, resolve_llm_config
 from .paths import BookPaths
 from .retrieval import retrieve_chapter_snippets
+from .spoiler import build_spoiler_blocked_response, resolve_spoiler_limits
 from .util import excerpt, normalize_whitespace, read_json, write_json
 
 
@@ -55,6 +56,7 @@ def answer_question(
     history: list[dict[str, str]] | None = None,
     current_chapter: int | None = None,
     max_chapter: int | None = None,
+    auto_spoiler: bool = True,
     model: str | None = None,
     logger: logging.Logger | None = None,
 ) -> dict:
@@ -67,19 +69,42 @@ def answer_question(
         chapters = []
 
     book_id = str(record.get("book_id", paths.book_dir.name))
+    limits = resolve_spoiler_limits(
+        current_chapter=current_chapter,
+        max_chapter=max_chapter,
+        auto_spoiler=auto_spoiler,
+    )
+
+    blocked = build_spoiler_blocked_response(
+        clean_question,
+        paths.chapters_dir,
+        chapters,
+        book_id=book_id,
+        limits=limits,
+    )
+    if blocked is not None:
+        return blocked
+
     snippets = retrieve_chapter_snippets(
         paths.chapters_dir,
         clean_question,
         chapters,
         book_id=book_id,
-        current_chapter=current_chapter,
-        max_chapter=max_chapter,
+        current_chapter=limits.current_chapter,
+        max_chapter=limits.max_chapter,
+        allow_fallback=False,
     )
     if not snippets:
-        if max_chapter is not None:
-            raise CompanionError(
-                f"No chapter context was available within the spoiler limit (chapters 1–{max_chapter})."
-            )
+        snippets = retrieve_chapter_snippets(
+            paths.chapters_dir,
+            clean_question,
+            chapters,
+            book_id=book_id,
+            current_chapter=limits.current_chapter,
+            max_chapter=limits.max_chapter,
+            allow_fallback=True,
+        )
+    if not snippets:
         raise CompanionError("No chapter context was available for this book.")
 
     if logger:
@@ -90,10 +115,10 @@ def answer_question(
             [snippet.get("chunk_id") for snippet in snippets],
         )
 
-    instructions = build_instructions(record, max_chapter=max_chapter)
+    instructions = build_instructions(record, max_chapter=limits.max_chapter)
     prior_turns = _format_history(history or [])
     context = format_retrieved_context(snippets)
-    reading_position = _format_reading_position(current_chapter, max_chapter)
+    reading_position = _format_reading_position(limits)
     input_text = (
         f"Book metadata:\n{json.dumps(_book_context(record), ensure_ascii=False, indent=2)}\n\n"
         f"Reading position:\n{reading_position}\n\n"
@@ -117,8 +142,10 @@ def answer_question(
         "sources": sources,
         "chunks": snippets,
         "citation_check": citation_check,
-        "current_chapter": current_chapter,
-        "max_chapter": max_chapter,
+        "current_chapter": limits.current_chapter,
+        "max_chapter": limits.max_chapter,
+        "spoiler_auto_linked": limits.auto_linked,
+        "spoiler_blocked": False,
         "_trace": {
             "retrieved_snippets": snippets,
             "retrieved_sources": sources,
@@ -170,6 +197,7 @@ def chat_loop(
     *,
     current_chapter: int | None = None,
     max_chapter: int | None = None,
+    auto_spoiler: bool = True,
     model: str | None = None,
     show_sources: bool = False,
 ) -> None:
@@ -193,7 +221,19 @@ def chat_loop(
     print(f"   {record.get('chapter_count', 0)} chapters")
     print(f"   Model: {model_label}")
     print(f"   Current chapter: {session.get('current_chapter') or 'not set'}")
-    print(f"   Spoiler guard: {session.get('max_chapter') or 'off'}")
+    limits = resolve_spoiler_limits(
+        current_chapter=session.get("current_chapter"),
+        max_chapter=session.get("max_chapter"),
+        auto_spoiler=auto_spoiler,
+    )
+    spoiler_label = "off"
+    if limits.max_chapter is not None:
+        spoiler_label = f"chapters 1–{limits.max_chapter}"
+        if limits.auto_linked:
+            spoiler_label += " (auto-linked to current chapter)"
+    print(f"   Spoiler guard: {spoiler_label}")
+    if record.get("content_start_chapter"):
+        print(f"   Content starts: chapter {record['content_start_chapter']}")
     print(f"   Show sources: {'on' if session.get('show_sources') else 'off'}")
     print()
     print("Commands:")
@@ -246,6 +286,8 @@ def chat_loop(
                 print("Usage: /chapter N")
                 continue
             session["current_chapter"] = int(value)
+            if auto_spoiler:
+                session["max_chapter"] = int(value)
             save_session(paths, {**session, "history": history})
             chapter = _find_chapter(record, int(value))
             if chapter:
@@ -277,6 +319,7 @@ def chat_loop(
                 history=history,
                 current_chapter=session.get("current_chapter"),
                 max_chapter=session.get("max_chapter"),
+                auto_spoiler=auto_spoiler,
                 model=model,
             )
         except CompanionError as error:
@@ -319,14 +362,16 @@ def _book_context(record: dict) -> dict:
     }
 
 
-def _format_reading_position(current_chapter: int | None, max_chapter: int | None) -> str:
+def _format_reading_position(limits) -> str:
     lines = []
-    if current_chapter is not None:
-        lines.append(f"The reader is currently on chapter {current_chapter}.")
+    if limits.current_chapter is not None:
+        lines.append(f"The reader is currently on chapter {limits.current_chapter}.")
     else:
         lines.append("The reader has not set a current chapter.")
-    if max_chapter is not None:
-        lines.append(f"Do not use content from chapters after {max_chapter}.")
+    if limits.max_chapter is not None:
+        lines.append(f"Do not use content from chapters after {limits.max_chapter}.")
+        if limits.auto_linked:
+            lines.append("Spoiler guard is auto-linked to the current chapter.")
     return "\n".join(lines)
 
 

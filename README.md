@@ -84,6 +84,21 @@ Chat commands: `/chapter N`, `/spoiler N`, `/sources`, `/chapters`, `/clear`, `/
 
 Retrieved chunks use stable ids like `book-id:ch007:c001` and are shown independently of model prose.
 
+### Spoiler guard semantics
+
+- Spine order defines chapter numbers (including front matter).
+- Chapters are classified as `front_matter`, `body`, or `back_matter`; `content_start_chapter` marks where reading usually begins.
+- `--chapter N` auto-links spoiler guard to chapter N unless you pass `--spoiler` or `--no-spoiler-auto`.
+- `/spoiler off` intentionally disables spoiler protection.
+- When no relevant excerpts exist within the spoiler limit, the app returns a deterministic refusal without calling the LLM.
+
+Run the spoiler eval suite (optional LLM judge):
+
+```bash
+book-search eval spoiler
+book-search eval spoiler --judge-model minimax/minimax-m2.5
+```
+
 ## Data layout
 
 ```

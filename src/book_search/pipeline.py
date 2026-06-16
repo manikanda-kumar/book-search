@@ -3,9 +3,22 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from .chapters import content_start_chapter, enrich_book_chapters
 from .extractors import extract_book
 from .paths import BookPaths, book_paths, books_root
 from .util import ensure_dir, read_json, slugify, write_json
+
+
+def _normalize_record(record: dict) -> dict:
+    chapters = record.get("chapters", [])
+    if not isinstance(chapters, list):
+        return record
+    enriched = enrich_book_chapters(chapters)
+    normalized = dict(record)
+    normalized["chapters"] = enriched
+    if not normalized.get("content_start_chapter"):
+        normalized["content_start_chapter"] = content_start_chapter(enriched)
+    return normalized
 
 
 def ingest_source(
@@ -53,7 +66,7 @@ def load_book_record(book_id: str, workspace: Path | None = None) -> tuple[dict,
     record = read_json(paths.book_record_path)
     if not isinstance(record, dict):
         raise ValueError(f"Invalid book record for `{book_id}`.")
-    return record, paths
+    return _normalize_record(record), paths
 
 
 def list_books(workspace: Path | None = None) -> list[dict[str, str]]:

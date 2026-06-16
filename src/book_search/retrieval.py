@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .chapters import FRONT_MATTER_TITLES, normalize_chapter_title
 from .citations import format_sources, make_chunk_id
 from .util import normalize_whitespace, split_markdown_paragraphs
 
@@ -40,22 +41,6 @@ STOPWORDS = {
     "with",
 }
 
-FRONT_MATTER_TITLES = {
-    "cover",
-    "title",
-    "mini toc",
-    "copyrightnotice",
-    "copyright",
-    "dedication",
-    "epigraph",
-    "also by",
-    "praise",
-    "advance praise",
-    "contents",
-    "table of contents",
-}
-
-
 def retrieve_chapter_snippets(
     chapters_dir: Path,
     question: str,
@@ -66,6 +51,7 @@ def retrieve_chapter_snippets(
     max_chapter: int | None = None,
     limit: int = 6,
     min_word_count: int = 30,
+    allow_fallback: bool = True,
 ) -> list[dict]:
     query_tokens = _tokenize(question)
     chapter_meta = _chapter_meta_by_file(chapters or [])
@@ -97,6 +83,8 @@ def retrieve_chapter_snippets(
     )
 
     if not scored:
+        if not allow_fallback:
+            return []
         fallbacks = [
             chunk
             for chunk in chunks
@@ -174,11 +162,13 @@ def _iter_chapter_chunks(
         text = path.read_text(encoding="utf-8")
         chapter_title = str(meta.get("title", path.stem))
         word_count = int(meta.get("word_count", len(text.split())))
+        chapter_kind = str(meta.get("kind", "body"))
         for chunk_index, chunk in enumerate(_split_markdown_file(path, text), start=1):
             chunk.update(
                 {
                     "chapter_index": chapter_index,
                     "chapter_title": chapter_title,
+                    "chapter_kind": chapter_kind,
                     "word_count": word_count,
                     "chunk_index": chunk_index,
                     "chunk_id": make_chunk_id(book_id, chapter_index, chunk_index),
@@ -196,8 +186,10 @@ def _index_from_filename(file_name: str) -> int:
 
 
 def _is_front_matter(chunk: dict) -> bool:
-    title = str(chunk.get("chapter_title", "")).strip().lower()
-    return title in FRONT_MATTER_TITLES
+    if str(chunk.get("chapter_kind", "")) == "front_matter":
+        return True
+    normalized = normalize_chapter_title(str(chunk.get("chapter_title", "")))
+    return normalized in FRONT_MATTER_TITLES
 
 
 def _split_markdown_file(path: Path, text: str) -> list[dict]:
@@ -283,11 +275,12 @@ def _score_chunk(
     chunk_tokens = _tokenize(haystack)
     heading_tokens = _tokenize(heading_haystack)
     overlap = query_tokens & chunk_tokens
+    heading_overlap = query_tokens & heading_tokens
     score = len(overlap) * 4
-    score += len(query_tokens & heading_tokens) * 6
+    score += len(heading_overlap) * 6
 
     chapter_index = int(chunk.get("chapter_index", 0))
-    if current_chapter is not None:
+    if current_chapter is not None and (overlap or heading_overlap):
         distance = abs(chapter_index - current_chapter)
         if distance == 0:
             score += 24
@@ -324,4 +317,4 @@ def _tokenize(text: str) -> set[str]:
     }
 
 
-__all__ = ["retrieve_chapter_snippets", "search_chapters", "format_sources", "FRONT_MATTER_TITLES"]
+__all__ = ["retrieve_chapter_snippets", "search_chapters", "format_sources"]

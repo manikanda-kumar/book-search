@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from zipfile import ZipFile, is_zipfile
 
 from ..calibre import read_ebook_meta
+from ..chapters import classify_chapter, content_start_chapter, enrich_book_chapters
 from ..paths import BookPaths
 from ..util import ensure_dir, excerpt, local_name, markdown_code_block, normalize_whitespace, slugify, utc_now, word_count, write_text
 
@@ -234,6 +235,13 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
             markdown = _xhtml_to_markdown(raw)
             fallback = PurePosixPath(item["href"]).stem.replace("_", " ").replace("-", " ").strip() or f"Chapter {chapter_index}"
             chapter_title = _chapter_title(markdown, fallback.title())
+            chapter_excerpt = excerpt(markdown)
+            chapter_words = word_count(markdown)
+            chapter_kind = classify_chapter(
+                chapter_title,
+                word_count=chapter_words,
+                excerpt=chapter_excerpt,
+            )
 
             chapter_slug = slugify(chapter_title, max_length=48)
             chapter_file = paths.chapters_dir / f"{chapter_index:03d}-{chapter_slug}.md"
@@ -243,10 +251,11 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
                 {
                     "index": chapter_index,
                     "title": chapter_title,
+                    "kind": chapter_kind,
                     "source_href": item["href"],
                     "path": str(chapter_file.relative_to(paths.root)),
-                    "word_count": word_count(markdown),
-                    "excerpt": excerpt(markdown),
+                    "word_count": chapter_words,
+                    "excerpt": chapter_excerpt,
                 }
             )
             combined_parts.append(f"# {chapter_title}\n\n{markdown.strip()}\n")
@@ -281,7 +290,8 @@ def extract_epub(source_path: Path, paths: BookPaths) -> dict:
         "extracted_at": utc_now(),
         "combined_markdown_path": str(combined_path.relative_to(paths.root)),
         "chapter_count": len(chapters),
-        "chapters": chapters,
+        "content_start_chapter": content_start_chapter(chapters),
+        "chapters": enrich_book_chapters(chapters),
         "metadata_sources": {
             "native_opf": native_metadata,
             "calibre_normalized": calibre_metadata,
