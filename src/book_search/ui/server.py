@@ -221,6 +221,33 @@ INDEX_HTML = """<!doctype html>
       color: var(--muted);
       font-style: italic;
     }
+    .message-spoiler {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .message-body { line-height: 1.55; }
+    .citation-warning {
+      margin-top: 8px;
+      font-size: 0.85rem;
+      color: var(--trust-warning);
+      background: #f8e8c8;
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .health {
+      margin-top: 16px;
+      font-size: 0.85rem;
+      display: grid;
+      gap: 6px;
+    }
+    .health-item {
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #efe5da;
+    }
+    .health-item.warn { background: #f8e8c8; color: var(--trust-warning); }
+    .health-item.fail { background: #f2ddd8; color: var(--trust-blocked); }
     @media (max-width: 1100px) {
       .app { grid-template-columns: 1fr; }
       .sidebar, .companion { border-right: 0; border-bottom: 1px solid var(--border); }
@@ -247,6 +274,7 @@ INDEX_HTML = """<!doctype html>
       <div id="contentStart" class="subtle"></div>
       <ul id="chapterList" class="chapter-list"></ul>
       <div id="warnings" class="warnings" hidden></div>
+      <div id="healthBar" class="health"></div>
     </aside>
 
     <main class="reader">
@@ -309,6 +337,20 @@ INDEX_HTML = """<!doctype html>
       return status || "uncited";
     }
 
+    function escapeHtml(value) {
+      return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[ch]);
+    }
+
+    function formatText(value) {
+      return escapeHtml(value).replace(/\\n/g, "<br>");
+    }
+
     function renderSourceCards(sources, target) {
       target.innerHTML = "";
       if (!sources || !sources.length) {
@@ -319,10 +361,10 @@ INDEX_HTML = """<!doctype html>
         const card = document.createElement("div");
         card.className = "source-card";
         card.innerHTML = `
-          <strong>${source.chunk_id}</strong>
-          <div>Ch ${source.chapter_index}: ${source.chapter_title}</div>
-          ${source.heading ? `<div>Heading: ${source.heading}</div>` : ""}
-          <div class="source-excerpt">"${source.excerpt}"</div>
+          <strong>${escapeHtml(source.chunk_id)}</strong>
+          <div>Ch ${escapeHtml(source.chapter_index)}: ${escapeHtml(source.chapter_title)}</div>
+          ${source.heading ? `<div>Heading: ${escapeHtml(source.heading)}</div>` : ""}
+          <div class="source-excerpt">"${escapeHtml(source.excerpt)}"</div>
         `;
         card.addEventListener("click", () => loadChapter(source.chapter_index));
         target.appendChild(card);
@@ -334,20 +376,29 @@ INDEX_HTML = """<!doctype html>
       const item = document.createElement("div");
       item.className = `message ${role}`;
       const badge = meta.trust_status
-        ? `<span class="trust-badge ${trustClass(meta.trust_status)}">${meta.trust_label || meta.trust_status}</span>`
+        ? `<span class="trust-badge ${trustClass(meta.trust_status)}">${escapeHtml(meta.trust_label || meta.trust_status)}</span>`
+        : "";
+      const spoiler = meta.spoiler_state
+        ? `<div class="message-spoiler">${escapeHtml(meta.spoiler_state.label)}</div>`
+        : "";
+      const unknown = (meta.citation_check && meta.citation_check.unknown_chunk_ids) || [];
+      const citationWarning = unknown.length
+        ? `<div class="citation-warning">⚠ Model cited chunk ids not in retrieval: ${escapeHtml(unknown.join(", "))}</div>`
         : "";
       const sources = meta.sources || [];
       const sourceHtml = sources.map((source) => `
         <div class="source-card">
-          <strong>${source.chunk_id}</strong>
-          <div>Ch ${source.chapter_index}: ${source.chapter_title}</div>
-          <div class="source-excerpt">"${source.excerpt}"</div>
+          <strong>${escapeHtml(source.chunk_id)}</strong>
+          <div>Ch ${escapeHtml(source.chapter_index)}: ${escapeHtml(source.chapter_title)}</div>
+          <div class="source-excerpt">"${escapeHtml(source.excerpt)}"</div>
         </div>
       `).join("");
-      item.innerHTML = `${badge}<div>${text}</div>${sourceHtml}`;
+      item.innerHTML = `${badge}${spoiler}<div class="message-body">${formatText(text)}</div>${citationWarning}${sourceHtml}`;
       log.appendChild(item);
       log.scrollTop = log.scrollHeight;
-      renderSourceCards(sources, document.getElementById("sourcesPanel"));
+      if (role === "assistant") {
+        renderSourceCards(sources, document.getElementById("sourcesPanel"));
+      }
     }
 
     async function loadBooks() {
@@ -486,17 +537,39 @@ INDEX_HTML = """<!doctype html>
       });
       const payload = await api(`/api/books/${encodeURIComponent(state.bookId)}/search?${params}`);
       const target = document.getElementById("searchResults");
-      target.innerHTML = `<p class="subtle">${payload.note}</p>`;
+      target.innerHTML = `<p class="subtle">${escapeHtml(payload.note)}</p>`;
       for (const result of payload.results || []) {
         const card = document.createElement("div");
         card.className = "source-card";
         card.innerHTML = `
-          <strong>${result.chunk_id}</strong>
-          <div>Ch ${result.chapter_index}: ${result.chapter_title}</div>
-          <div class="source-excerpt">"${result.text.slice(0, 220)}..."</div>
+          <strong>${escapeHtml(result.chunk_id)}</strong>
+          <div>Ch ${escapeHtml(result.chapter_index)}: ${escapeHtml(result.chapter_title)}</div>
+          <div class="source-excerpt">"${escapeHtml(result.text.slice(0, 220))}..."</div>
         `;
         card.addEventListener("click", () => loadChapter(result.chapter_index));
         target.appendChild(card);
+      }
+    }
+
+    async function loadHealth() {
+      const el = document.getElementById("healthBar");
+      try {
+        const checks = await api("/api/doctor");
+        const issues = (checks || []).filter((check) => check.status !== "ok");
+        if (!issues.length) {
+          el.innerHTML = '<div class="subtle">Health checks: all OK</div>';
+          return;
+        }
+        el.innerHTML =
+          "<strong>Health checks</strong>" +
+          issues
+            .map(
+              (check) =>
+                `<div class="health-item ${check.status}"><span class="kind">${escapeHtml(check.status)}</span>${escapeHtml(check.message)}</div>`
+            )
+            .join("");
+      } catch (error) {
+        el.innerHTML = `<div class="subtle">Health check unavailable: ${escapeHtml(error.message)}</div>`;
       }
     }
 
@@ -506,8 +579,9 @@ INDEX_HTML = """<!doctype html>
     document.getElementById("askBtn").addEventListener("click", askQuestion);
     document.getElementById("searchBtn").addEventListener("click", runSearch);
     loadBooks().catch((error) => {
-      document.getElementById("readerContent").innerHTML = `<p class="empty">${error.message}</p>`;
+      document.getElementById("readerContent").innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
     });
+    loadHealth();
   </script>
 </body>
 </html>

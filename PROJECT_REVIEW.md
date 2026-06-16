@@ -508,3 +508,30 @@ The next product risk is no longer primarily “is the backend trustworthy enoug
 > Does the UI preserve and communicate backend trust signals instead of hiding them?
 
 Start the UI only if it keeps spoiler state, retrieved sources, warnings, and uncertainty visible. If the UI presents answers as polished standalone AI prose without source cards and spoiler state, it will weaken the trust loop that the backend now provides.
+
+---
+
+# Third-pass: UI trust-signal hardening
+
+The MVP reader already shipped book/chapter navigation, chapter-kind labels, a spoiler pill, source cards, lexical search, and trust badges. This pass closed the remaining "communicate the backend trust signals" gaps the second-pass review called out.
+
+## Changes
+
+- **Per-answer spoiler state.** Each assistant message now renders the resolved `spoiler_state.label` ("Using chapters 1–N", auto-linked note, or "Spoiler guard off") inline, not just in the sidebar pill — so the spoiler context travels with the answer.
+- **Inline citation warnings.** When the model cites a chunk id outside the retrieved set, the message surfaces the offending ids beneath the answer (in addition to the `citation_warning` badge).
+- **Health/status surface.** The sidebar now consumes `/api/doctor` and lists any `warn`/`fail` checks (LLM config, optional packages, extraction warnings, ingested-book state), satisfying the "ingestion/status surface" pane. Endpoints existed but had no consumer before.
+- **Escaped dynamic content.** Model answer prose, source fields, and search results are now HTML-escaped before injection (newlines preserved as `<br>`), removing a raw-`innerHTML` injection/faithfulness risk. Chapter Markdown is still rendered by the server-side escaping renderer.
+- **Sources panel no longer flickers** to "No sources yet." when a user message is appended; it only refreshes on assistant answers.
+
+## Verification
+
+```text
+pytest: 47 passed
+book-search eval all --no-judge: 24/24 passed
+```
+
+A live `serve` smoke test confirmed `/`, `/api/doctor`, and `/api/books` respond and the new client code is present.
+
+## Still deliberately deferred
+
+Exact passage highlighting, persistent annotations, vector search, PDF, arbitrary drag-and-drop EPUB import, persona layer, and cross-book search remain out of scope until real usage justifies them.
