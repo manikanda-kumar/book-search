@@ -21,5 +21,5 @@ class TestEvalSuites:
 
     def test_workflow_eval_passes(self, tmp_path) -> None:
         results = run_workflow_eval(tmp_path)
-        assert len(results) == 5
+        assert len(results) == 8
         assert all(result.passed for result in results)

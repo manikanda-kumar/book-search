@@ -4,6 +4,7 @@ import json
 import logging
 
 from .citations import (
+    enrich_result_trust,
     format_retrieved_context,
     format_sources,
     print_sources,
@@ -83,7 +84,7 @@ def answer_question(
         limits=limits,
     )
     if blocked is not None:
-        return blocked
+        return enrich_result_trust(blocked)
 
     snippets = retrieve_chapter_snippets(
         paths.chapters_dir,
@@ -136,22 +137,24 @@ def answer_question(
 
     sources = format_sources(snippets)
     citation_check = validate_answer_citations(answer, snippets)
-    return {
-        "answer": answer,
-        "model": resolved_model,
-        "sources": sources,
-        "chunks": snippets,
-        "citation_check": citation_check,
-        "current_chapter": limits.current_chapter,
-        "max_chapter": limits.max_chapter,
-        "spoiler_auto_linked": limits.auto_linked,
-        "spoiler_blocked": False,
-        "_trace": {
-            "retrieved_snippets": snippets,
-            "retrieved_sources": sources,
+    return enrich_result_trust(
+        {
+            "answer": answer,
+            "model": resolved_model,
+            "sources": sources,
+            "chunks": snippets,
             "citation_check": citation_check,
-        },
-    }
+            "current_chapter": limits.current_chapter,
+            "max_chapter": limits.max_chapter,
+            "spoiler_auto_linked": limits.auto_linked,
+            "spoiler_blocked": False,
+            "_trace": {
+                "retrieved_snippets": snippets,
+                "retrieved_sources": sources,
+                "citation_check": citation_check,
+            },
+        }
+    )
 
 
 def load_session(paths: BookPaths) -> dict:

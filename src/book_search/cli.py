@@ -100,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd = subparsers.add_parser("config", help="Show resolved workspace and model configuration")
     config_cmd.add_argument("--json", action="store_true", help="Print machine-readable output")
 
+    serve = subparsers.add_parser("serve", help="Start the constrained reading companion UI")
+    serve.add_argument("--host", default="127.0.0.1", help="Bind host")
+    serve.add_argument("--port", type=int, default=8765, help="Bind port")
+    serve.add_argument("--book-id", help="Optional default book id")
+    serve.add_argument("--open", action="store_true", help="Open the UI in a browser")
+
     subparsers.add_parser("doctor", help="Validate workspace, dependencies, and ingested books")
 
     session = subparsers.add_parser("session", help="Export or reset persisted companion sessions")
@@ -404,6 +410,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             return 1
 
+        if args.command == "serve":
+            from .ui import serve_ui
+
+            serve_ui(
+                host=args.host,
+                port=args.port,
+                workspace=workspace,
+                book_id=args.book_id,
+                open_browser=args.open,
+            )
+            return 0
+
         if args.command == "doctor":
             checks = run_doctor(workspace)
             for check in checks:
@@ -521,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
                 auto_spoiler=not args.no_spoiler_auto,
                 model=args.model,
             )
+            if result.get("trust_label"):
+                print(f"[{result['trust_label']}]")
             print(result["answer"])
             _print_ask_sources(result, show_sources=args.show_sources)
             return 0

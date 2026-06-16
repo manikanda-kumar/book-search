@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from book_search.citations import (
+    answer_trust_status,
+    enrich_result_trust,
     format_sources,
     make_chunk_id,
+    trust_status_label,
     validate_answer_citations,
 )
 
@@ -45,3 +48,31 @@ class TestCitations:
         result = validate_answer_citations(answer, snippets)
         assert result["valid_chunk_ids"] == ["book:ch007:c001"]
         assert result["unknown_chunk_ids"] == ["book:ch099:c001"]
+
+    def test_answer_trust_status(self) -> None:
+        assert answer_trust_status({"spoiler_blocked": True}) == "spoiler_blocked"
+        assert (
+            answer_trust_status(
+                {
+                    "sources": [{"chunk_id": "book:ch001:c001"}],
+                    "citation_check": {"valid_chunk_ids": [], "unknown_chunk_ids": []},
+                }
+            )
+            == "sources_available_no_inline_citations"
+        )
+        assert (
+            answer_trust_status(
+                {
+                    "citation_check": {"valid_chunk_ids": ["book:ch001:c001"], "unknown_chunk_ids": []},
+                }
+            )
+            == "cited"
+        )
+        enriched = enrich_result_trust(
+            {
+                "answer": "x",
+                "citation_check": {"valid_chunk_ids": [], "unknown_chunk_ids": ["book:ch099:c001"]},
+            }
+        )
+        assert enriched["trust_status"] == "citation_warning"
+        assert trust_status_label("citation_warning") == "Citation warning"

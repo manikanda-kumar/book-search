@@ -223,3 +223,288 @@ The strongest version of this project is not “an AI reader for every document 
 > A trustworthy, spoiler-safe companion for books you are actively reading.
 
 The next best investment is the trust layer: reliable chapter structure, stable chunks, auditable citations, spoiler-correct retrieval, and small evals. Once users believe the answers and the spoiler guard, the UI/PDF/persona ideas become much safer to build.
+
+---
+
+# Second-pass review: trust loop readiness for UI
+
+## Decision
+
+After the recent trust-loop changes, the project is ready to begin a constrained integrated reader UI.
+
+> Proceed to UI now, but keep the first UI source-forward, spoiler-forward, and deliberately narrow.
+
+The backend trust loop is now sufficient for an MVP because answers are source-backed, spoiler-bounded, auditable, and covered by deterministic product evals. The remaining backend limitations are real, but they are quality and UX constraints rather than blockers to starting a cautious UI.
+
+Do not block the first UI on semantic/vector retrieval, persisted chunk indexes, perfect EPUB parsing, PDF support, or exact passage highlighting.
+
+## Verification
+
+The following checks passed after the recent changes:
+
+```bash
+.venv/bin/python -m pytest
+```
+
+Result:
+
+```text
+42 passed
+```
+
+```bash
+.venv/bin/python -m book_search eval all --no-judge
+```
+
+Result:
+
+```text
+All evals: 21/21 passed
+
+Spoiler (5/5)
+  [PASS] auto_link_spoiler
+  [PASS] refusal_with_later_match
+  [PASS] refusal_without_later_match
+  [PASS] front_matter_classification
+  [PASS] spoiler_excludes_later_retrieval
+Retrieval (7/7)
+  [PASS] summarize_chapter_prefers_target
+  [PASS] character_introduction
+  [PASS] spoiler_retrieval_excludes_later
+  [PASS] themes_respect_spoiler
+  [PASS] chapter_boost_predictable
+  [PASS] search_returns_chunk_ids
+  [PASS] later_answer_blocked
+Ingestion (4/4)
+  [PASS] watermark_warnings
+  [PASS] warnings_stored_on_record
+  [PASS] content_start_detected
+  [PASS] duplicate_identifier_guard
+Workflow (5/5)
+  [PASS] session_export_includes_metadata
+  [PASS] session_reset_clears_history
+  [PASS] session_reset_keep_position
+  [PASS] config_describe_includes_workspace
+  [PASS] config_masks_api_keys
+```
+
+## What is now strong enough
+
+### Spoiler loop
+
+The spoiler behavior is now good enough for a UI MVP:
+
+- `--chapter` can auto-link the spoiler guard.
+- Explicit `--spoiler` still works.
+- Users can intentionally disable spoiler protection.
+- Retrieval enforces `max_chapter` before prompt construction.
+- If no allowed excerpts match but later chapters do, the app returns a deterministic refusal before calling the LLM.
+- Eval coverage exists for later-answer blocking, no-spoiler refusals, front matter classification, and retrieval exclusion.
+
+### Source and citation loop
+
+The app now has an auditable answer trail:
+
+- stable chunk IDs such as `book-id:ch007:c001`,
+- chunk-level source cards with chapter, title, heading, excerpt, and offsets,
+- citation validation for model-cited chunk IDs,
+- `--show-sources` and `/sources`,
+- text search without an LLM,
+- product eval coverage for chunk IDs and retrieval behavior.
+
+The UI should treat backend-provided source cards as the primary trust mechanism. Inline model citations are useful, but should not be the only evidence shown to users.
+
+### Workflow loop
+
+The CLI now exposes the core primitives that a UI will need:
+
+- `chapters`
+- `search`
+- `position`
+- `session`
+- `config`
+- `doctor`
+- `delete`
+- `eval`
+
+This indicates the user workflow has stabilized enough to put a first reader interface over it.
+
+## Recommended small hardening before or during UI
+
+Add a simple computed trust status for answer results so the UI can badge responses consistently.
+
+Example:
+
+```python
+def answer_trust_status(result: dict) -> str:
+    if result.get("spoiler_blocked"):
+        return "spoiler_blocked"
+
+    check = result.get("citation_check", {})
+    if check.get("unknown_chunk_ids"):
+        return "citation_warning"
+
+    if result.get("sources") and not check.get("valid_chunk_ids"):
+        return "sources_available_no_inline_citations"
+
+    if check.get("valid_chunk_ids"):
+        return "cited"
+
+    return "uncited"
+```
+
+Potential UI badges:
+
+- **Cited**
+- **Sources available**
+- **Citation warning**
+- **Spoiler blocked**
+
+This should not be treated as a blocker. It is a small bridge between backend trust signals and UI presentation.
+
+Also avoid presenting `char_start` / `char_end` as exact highlight anchors. They are useful diagnostics, but the current offsets may not map cleanly to rendered full-chapter Markdown. In the UI, either hide offsets or label them as approximate.
+
+## Remaining risks and guardrails
+
+### Lexical retrieval can miss paraphrased questions
+
+Retrieval remains lexical. It can miss vague or paraphrased questions such as “what does this mean?” if the query does not share enough terms with the text.
+
+Guardrails:
+
+- Let users include selected text in the question.
+- Bias strongly to the current chapter.
+- Always show source cards.
+- Use copy like “based on these excerpts” rather than “the book says.”
+- Consider semantic retrieval later only after real UI usage shows consistent recall failures.
+
+### Dynamic chunks are not ideal for long-term annotations
+
+Chunk IDs are generated from the current chapter Markdown and chunk order. This is acceptable for current Q&A, but less ideal for persistent annotations, saved source links, or re-ingestion stability.
+
+Guardrails:
+
+- Do not build persistent passage annotations in the first UI.
+- If annotations become important, add a persisted chunk manifest/index at ingest time.
+
+### Offsets are approximate
+
+`char_start` and `char_end` should not be used for exact highlighting yet.
+
+Guardrails:
+
+- Source clicks should navigate to chapter and heading.
+- If highlighting is attempted, search for the excerpt text as a best-effort behavior.
+- Do not promise exact source highlights in the MVP.
+
+### EPUB extraction is still strict
+
+The EPUB parser still relies on `ElementTree` and can fail on malformed XHTML.
+
+Guardrails:
+
+- Focus the first UI on already-ingested books.
+- Surface extraction errors and warnings clearly.
+- Do not make arbitrary drag-and-drop EPUB import the centerpiece until parsing is more tolerant.
+
+### Chapter classification is heuristic
+
+Front/body/back matter classification is useful but imperfect.
+
+Guardrails:
+
+- Show chapter kind labels.
+- Show `content_start_chapter`.
+- Let users manually set current chapter and spoiler guard.
+- Explain that chapter numbers follow EPUB spine order, including front matter.
+
+### Inline citations are not guaranteed
+
+The model is instructed to cite chunk IDs, and unknown cited IDs are detected, but answers are not rejected when the model omits inline citations.
+
+Guardrails:
+
+- Always show backend source cards independently of model prose.
+- Badge answers as “Sources available” when source cards exist but inline citations are missing.
+- Consider a later retry/repair step if missing inline citations become common.
+
+## Safe first UI scope
+
+### Reader pane
+
+Build a simple reader around the extracted chapter Markdown:
+
+- book list,
+- chapter list,
+- chapter Markdown display,
+- current chapter selector,
+- chapter kind labels: `front_matter`, `body`, `back_matter`,
+- `content_start_chapter` display,
+- manual spoiler override.
+
+Avoid trying to become a full EPUB renderer in the first UI.
+
+### Chat pane
+
+Use the existing companion path:
+
+- submit a question,
+- pass current chapter,
+- auto-link spoiler guard by default,
+- allow explicit spoiler override,
+- preserve deterministic spoiler refusal behavior.
+
+The UI should display spoiler state prominently:
+
+- “Using chapters 1–N”
+- “Auto-linked to current chapter”
+- “Spoiler guard off” only when intentionally disabled
+
+### Sources pane
+
+Always show source cards for each answer:
+
+- chunk ID,
+- chapter number and title,
+- heading,
+- excerpt,
+- citation warning if the model cited an unknown chunk ID.
+
+Do not hide sources behind an advanced debug toggle in the first UI. Source visibility is part of the trust loop.
+
+### Search pane
+
+Expose the existing lexical search.
+
+Label it honestly as text/book search, not semantic search.
+
+### Ingestion/status surface
+
+Show ingestion and project health signals:
+
+- extraction warnings,
+- content start chapter,
+- chapter classification,
+- config/doctor issues when relevant.
+
+## What not to build yet
+
+Defer these until the UI proves the core loop is useful:
+
+- exact passage highlighting,
+- persistent annotations tied to chunk offsets,
+- vector/embedding search,
+- PDF support,
+- polished arbitrary EPUB import flow,
+- author persona layer,
+- cross-book/library search.
+
+## Updated recommendation
+
+The trust loop is now set for a constrained UI MVP.
+
+The next product risk is no longer primarily “is the backend trustworthy enough?” It is:
+
+> Does the UI preserve and communicate backend trust signals instead of hiding them?
+
+Start the UI only if it keeps spoiler state, retrieved sources, warnings, and uncertainty visible. If the UI presents answers as polished standalone AI prose without source cards and spoiler state, it will weaken the trust loop that the backend now provides.

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .chapters import content_start_chapter, enrich_book_chapters
+from .citations import answer_trust_status, enrich_result_trust
 from .companion import load_session, save_session
 from .config import describe_config, mask_secret
 from .eval_fixtures import build_standard_eval_book, build_watermark_eval_book
@@ -137,6 +138,9 @@ def run_workflow_eval(workspace: Path | None = None) -> list[EvalResult]:
     results.append(_eval_session_reset_keep_position(tmp_root))
     results.append(_eval_config_describe_includes_workspace(tmp_root))
     results.append(_eval_config_masks_api_keys())
+    results.append(_eval_trust_status_spoiler_blocked(tmp_root))
+    results.append(_eval_trust_status_sources_available(tmp_root))
+    results.append(_eval_trust_status_citation_warning())
     return results
 
 
@@ -509,6 +513,60 @@ def _eval_config_describe_includes_workspace(workspace: Path) -> EvalResult:
         passed=bool(passed),
         details=f"workspace_root={config.get('workspace_root')}",
         evidence={"keys": sorted(config.keys())},
+    )
+
+
+def _eval_trust_status_spoiler_blocked(workspace: Path) -> EvalResult:
+    record, paths = build_standard_eval_book(workspace)
+    limits = resolve_spoiler_limits(current_chapter=3, max_chapter=3, auto_spoiler=False)
+    response = build_spoiler_blocked_response(
+        "antitrust interoperability",
+        paths.chapters_dir,
+        record["chapters"],
+        book_id="eval-book",
+        limits=limits,
+    )
+    enriched = enrich_result_trust(response or {})
+    passed = answer_trust_status(enriched) == "spoiler_blocked" and enriched.get("trust_label") == "Spoiler blocked"
+    return EvalResult(
+        id="trust_status_spoiler_blocked",
+        description="Spoiler-blocked answers expose spoiler_blocked trust status",
+        passed=passed,
+        details=f"trust_status={enriched.get('trust_status')}",
+        evidence={"trust_status": enriched.get("trust_status"), "trust_label": enriched.get("trust_label")},
+    )
+
+
+def _eval_trust_status_sources_available(workspace: Path) -> EvalResult:
+    enriched = enrich_result_trust(
+        {
+            "sources": [{"chunk_id": "eval-book:ch003:c001"}],
+            "citation_check": {"valid_chunk_ids": [], "unknown_chunk_ids": []},
+        }
+    )
+    passed = answer_trust_status(enriched) == "sources_available_no_inline_citations"
+    return EvalResult(
+        id="trust_status_sources_available",
+        description="Answers with backend sources but no inline citations badge as sources available",
+        passed=passed,
+        details=f"trust_status={enriched.get('trust_status')}",
+        evidence={"trust_status": enriched.get("trust_status")},
+    )
+
+
+def _eval_trust_status_citation_warning() -> EvalResult:
+    enriched = enrich_result_trust(
+        {
+            "citation_check": {"valid_chunk_ids": [], "unknown_chunk_ids": ["eval-book:ch099:c001"]},
+        }
+    )
+    passed = answer_trust_status(enriched) == "citation_warning"
+    return EvalResult(
+        id="trust_status_citation_warning",
+        description="Unknown inline citations badge as citation warning",
+        passed=passed,
+        details=f"trust_status={enriched.get('trust_status')}",
+        evidence={"trust_status": enriched.get("trust_status")},
     )
 
 

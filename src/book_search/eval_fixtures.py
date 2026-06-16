@@ -5,6 +5,7 @@ from pathlib import Path
 from .extractors.epub import extract_epub
 from .paths import BookPaths, book_paths
 from .testdata import make_minimal_epub
+from .util import write_json
 
 
 STANDARD_EVAL_CHAPTERS = [
@@ -33,6 +34,7 @@ def build_standard_eval_book(workspace: Path) -> tuple[dict, BookPaths]:
     )
     paths = book_paths("eval-book", workspace)
     record = extract_epub(epub_path, paths)
+    write_json(paths.book_record_path, record)
     return record, paths
 
 
@@ -47,4 +49,5 @@ def build_watermark_eval_book(workspace: Path) -> tuple[dict, BookPaths]:
     epub_path.write_bytes(make_minimal_epub(title="Watermark Book", chapters=chapters))
     paths = book_paths("watermark-book", workspace)
     record = extract_epub(epub_path, paths)
+    write_json(paths.book_record_path, record)
     return record, paths

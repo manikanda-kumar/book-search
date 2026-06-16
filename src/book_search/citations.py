@@ -73,6 +73,44 @@ def print_sources(snippets: list[dict], *, heading: str = "Retrieved sources") -
         print(f"      \"{source['excerpt']}\"")
 
 
+TRUST_STATUS_LABELS = {
+    "spoiler_blocked": "Spoiler blocked",
+    "citation_warning": "Citation warning",
+    "sources_available_no_inline_citations": "Sources available",
+    "cited": "Cited",
+    "uncited": "Uncited",
+}
+
+
+def answer_trust_status(result: dict) -> str:
+    if result.get("spoiler_blocked"):
+        return "spoiler_blocked"
+
+    check = result.get("citation_check", {})
+    if check.get("unknown_chunk_ids"):
+        return "citation_warning"
+
+    if result.get("sources") and not check.get("valid_chunk_ids"):
+        return "sources_available_no_inline_citations"
+
+    if check.get("valid_chunk_ids"):
+        return "cited"
+
+    return "uncited"
+
+
+def trust_status_label(status: str) -> str:
+    return TRUST_STATUS_LABELS.get(status, status.replace("_", " ").title())
+
+
+def enrich_result_trust(result: dict) -> dict:
+    status = answer_trust_status(result)
+    enriched = dict(result)
+    enriched["trust_status"] = status
+    enriched["trust_label"] = trust_status_label(status)
+    return enriched
+
+
 def validate_answer_citations(answer: str, snippets: list[dict]) -> dict:
     allowed_ids = {str(snippet.get("chunk_id", "")) for snippet in snippets if snippet.get("chunk_id")}
     referenced = _extract_chunk_ids(answer)
