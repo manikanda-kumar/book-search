@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .calibre import detect_calibre_tools
-from .llm import resolve_llm_config, LlmConfigError
+from .config import describe_config
+
 from .paths import books_root, workspace_root
 from .pipeline import list_books, load_book_record
 
@@ -40,11 +41,32 @@ def run_doctor(workspace: Path | None = None) -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("books_dir", "warn", "No data/books directory yet."))
 
-    try:
-        llm = resolve_llm_config()
-        checks.append(DoctorCheck("llm_api", "ok", f"LLM provider configured: {llm.provider} / {llm.model}"))
-    except LlmConfigError as error:
-        checks.append(DoctorCheck("llm_api", "warn", str(error)))
+    config = describe_config(workspace)
+    checks.append(DoctorCheck("workspace_config", "ok", f"Books dir: {config['books_dir']}"))
+
+    if config.get("llm"):
+        llm = config["llm"]
+        checks.append(
+            DoctorCheck(
+                "llm_api",
+                "ok",
+                f"LLM provider configured: {llm['provider']} / {llm['model']} (key {llm['api_key']})",
+            )
+        )
+    else:
+        checks.append(DoctorCheck("llm_api", "warn", config.get("llm_error", "LLM not configured")))
+
+    chat_model = config.get("env", {}).get("BOOK_SEARCH_CHAT_MODEL")
+    if chat_model:
+        checks.append(DoctorCheck("chat_model_override", "ok", f"BOOK_SEARCH_CHAT_MODEL={chat_model}"))
+    else:
+        checks.append(
+            DoctorCheck(
+                "chat_model_override",
+                "ok",
+                "Using default chat model (set BOOK_SEARCH_CHAT_MODEL to override).",
+            )
+        )
 
     if importlib.util.find_spec("openai") is None:
         checks.append(DoctorCheck("openai_package", "warn", "openai package not installed. Run: pip install -e '.[llm]'"))

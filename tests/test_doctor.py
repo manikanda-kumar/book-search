@@ -31,3 +31,10 @@ class TestDoctor:
         checks = run_doctor(tmp_path)
         ingested = next(check for check in checks if check.id == "ingested_books")
         assert ingested.status == "ok"
+
+    def test_doctor_includes_config_checks(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").touch()
+        checks = run_doctor(tmp_path)
+        ids = [check.id for check in checks]
+        assert "workspace_config" in ids
+        assert "chat_model_override" in ids

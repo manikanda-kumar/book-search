@@ -8,8 +8,10 @@ from pathlib import Path
 from .citations import print_sources
 from .companion import CompanionError, answer_question, chat_loop, set_reading_position
 from .llm import RECOMMENDED_MODELS
+from .config import describe_config
 from .doctor import doctor_has_failures, run_doctor
 from .pipeline import delete_book, ingest_source, list_books, load_book_record
+from .session_io import export_session, reset_session, session_summary
 from .paths import WorkspaceDiscoveryError
 from .eval import (
     DEFAULT_JUDGE_MODEL,
@@ -19,6 +21,7 @@ from .eval import (
     run_ingestion_eval,
     run_retrieval_eval,
     run_spoiler_eval,
+    run_workflow_eval,
 )
 from .retrieval import search_chapters
 
@@ -94,7 +97,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("models", help="List recommended chat models")
 
+    config_cmd = subparsers.add_parser("config", help="Show resolved workspace and model configuration")
+    config_cmd.add_argument("--json", action="store_true", help="Print machine-readable output")
+
     subparsers.add_parser("doctor", help="Validate workspace, dependencies, and ingested books")
+
+    session = subparsers.add_parser("session", help="Export or reset persisted companion sessions")
+    session.add_argument("book_id", help="Previously ingested book id")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_sub.add_parser("show", help="Show session summary")
+    session_export = session_sub.add_parser("export", help="Export session history to JSON")
+    session_export.add_argument("--output", type=Path, help="Destination file (default: companion dir)")
+    session_reset = session_sub.add_parser("reset", help="Clear session history")
+    session_reset.add_argument(
+        "--keep-position",
+        action="store_true",
+        help="Keep current chapter and spoiler guard when clearing history",
+    )
 
     delete = subparsers.add_parser("delete", help="Remove an ingested book from the workspace")
     delete.add_argument("book_id", help="Previously ingested book id")
@@ -105,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("spoiler", "Run spoiler-guard eval suite"),
         ("retrieval", "Run retrieval eval suite"),
         ("ingestion", "Run ingestion diagnostics eval suite"),
+        ("workflow", "Run workflow polish eval suite"),
         ("all", "Run all eval suites"),
     ):
         suite_parser = eval_sub.add_parser(suite_name, help=help_text)
@@ -335,6 +355,55 @@ def main(argv: list[str] | None = None) -> int:
             parser.parse_args(["position", "--help"])
             return 0
 
+        if args.command == "config":
+            payload = describe_config(workspace)
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                print(f"Workspace: {payload['workspace_root']}")
+                print(f"Books dir: {payload['books_dir']}")
+                print(f"Python: {payload['python_version']}")
+                if payload.get("llm"):
+                    llm = payload["llm"]
+                    print(f"LLM: {llm['provider']} / {llm['model']}")
+                    print(f"API key: {llm['api_key']}")
+                else:
+                    print(f"LLM: not configured ({payload.get('llm_error')})")
+                chat_model = payload.get("env", {}).get("BOOK_SEARCH_CHAT_MODEL")
+                if chat_model:
+                    print(f"BOOK_SEARCH_CHAT_MODEL: {chat_model}")
+            return 0
+
+        if args.command == "session":
+            record, paths = load_book_record(args.book_id, workspace)
+            if args.session_command == "show":
+                summary = session_summary(paths, record)
+                if getattr(args, "json", False):
+                    print(json.dumps(summary, indent=2, ensure_ascii=False))
+                else:
+                    print(f"Book: {summary.get('title')} ({summary.get('book_id')})")
+                    print(f"Current chapter: {summary.get('current_chapter') or 'not set'}")
+                    print(f"Spoiler guard: {summary.get('max_chapter') or 'off'}")
+                    print(f"Show sources: {'on' if summary.get('show_sources') else 'off'}")
+                    print(f"Turns: {summary.get('turn_count', 0)}")
+                    if summary.get("updated_at"):
+                        print(f"Updated: {summary['updated_at']}")
+                return 0
+            if args.session_command == "export":
+                destination = export_session(paths, record, output_path=args.output)
+                print(f"Exported session to {destination}")
+                return 0
+            if args.session_command == "reset":
+                cleared = reset_session(paths, keep_position=args.keep_position)
+                print("Session reset.")
+                if args.keep_position:
+                    print(f"Kept current chapter: {cleared.get('current_chapter') or 'not set'}")
+                    print(f"Kept spoiler guard: {cleared.get('max_chapter') or 'off'}")
+                else:
+                    print("Cleared reading position and spoiler guard.")
+                return 0
+            return 1
+
         if args.command == "doctor":
             checks = run_doctor(workspace)
             for check in checks:
@@ -360,7 +429,10 @@ def main(argv: list[str] | None = None) -> int:
                 "ingestion": (
                     "P1: extraction warnings, content start detection, duplicate identifier guard."
                 ),
-                "all": "Aggregated spoiler, retrieval, and ingestion suites.",
+                "workflow": (
+                    "P2: session export/reset, config diagnostics with masked secrets."
+                ),
+                "all": "Aggregated spoiler, retrieval, ingestion, and workflow suites.",
             }
             if args.eval_command == "spoiler":
                 return _run_eval_suite(
@@ -388,6 +460,15 @@ def main(argv: list[str] | None = None) -> int:
                     no_judge=args.no_judge,
                     json_output=args.json,
                     implementation_notes=eval_notes["ingestion"],
+                )
+            if args.eval_command == "workflow":
+                return _run_eval_suite(
+                    "workflow",
+                    run_workflow_eval(workspace),
+                    judge_model=None if args.no_judge else args.judge_model,
+                    no_judge=args.no_judge,
+                    json_output=args.json,
+                    implementation_notes=eval_notes["workflow"],
                 )
             if args.eval_command == "all":
                 suites = run_all_evals(workspace)

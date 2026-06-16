@@ -13,7 +13,7 @@ from .llm import LlmConfigError, complete_chat, resolve_llm_config
 from .paths import BookPaths
 from .retrieval import retrieve_chapter_snippets
 from .spoiler import build_spoiler_blocked_response, resolve_spoiler_limits
-from .util import excerpt, normalize_whitespace, read_json, write_json
+from .util import excerpt, normalize_whitespace, read_json, utc_now, write_json
 
 
 class CompanionError(RuntimeError):
@@ -157,15 +157,16 @@ def answer_question(
 def load_session(paths: BookPaths) -> dict:
     session_path = paths.companion_dir / "session.json"
     if not session_path.exists():
-        return {"current_chapter": None, "max_chapter": None, "show_sources": False, "history": []}
+        return _empty_session()
     payload = read_json(session_path)
     if not isinstance(payload, dict):
-        return {"current_chapter": None, "max_chapter": None, "show_sources": False, "history": []}
+        return _empty_session()
     return {
         "current_chapter": payload.get("current_chapter"),
         "max_chapter": payload.get("max_chapter"),
         "show_sources": bool(payload.get("show_sources", False)),
         "history": payload.get("history", []) if isinstance(payload.get("history"), list) else [],
+        "updated_at": payload.get("updated_at"),
     }
 
 
@@ -177,8 +178,19 @@ def save_session(paths: BookPaths, session: dict) -> None:
             "max_chapter": session.get("max_chapter"),
             "show_sources": bool(session.get("show_sources", False)),
             "history": session.get("history", [])[-20:],
+            "updated_at": session.get("updated_at") or utc_now(),
         },
     )
+
+
+def _empty_session() -> dict:
+    return {
+        "current_chapter": None,
+        "max_chapter": None,
+        "show_sources": False,
+        "history": [],
+        "updated_at": None,
+    }
 
 
 def set_reading_position(paths: BookPaths, *, current_chapter: int | None = None, max_chapter: int | None = None) -> dict:

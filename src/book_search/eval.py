@@ -5,9 +5,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .chapters import content_start_chapter, enrich_book_chapters
+from .companion import load_session, save_session
+from .config import describe_config, mask_secret
 from .eval_fixtures import build_standard_eval_book, build_watermark_eval_book
 from .llm import LlmConfigError, complete_chat
 from .pipeline import ingest_source
+from .session_io import export_session, reset_session
 from .retrieval import retrieve_chapter_snippets, search_chapters
 from .spoiler import build_spoiler_blocked_response, resolve_spoiler_limits
 from .testdata import make_minimal_epub
@@ -40,8 +43,16 @@ Return JSON only with keys:
 - findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
 - summary: string
 Be concrete. Fail the review if extraction warnings or duplicate guards are missing or weak.""",
+    "workflow": """You are a strict QA judge for a book-reading companion product.
+Review deterministic eval results for user workflow polish (session export/reset, config diagnostics).
+Return JSON only with keys:
+- overall_pass: boolean
+- score: number from 0 to 100
+- findings: array of {severity: "high"|"medium"|"low", issue: string, recommendation: string}
+- summary: string
+Be concrete. Fail the review if session export/reset or config diagnostics are incomplete.""",
     "all": """You are a strict QA judge for a book-reading companion product.
-Review aggregated eval results across spoiler, retrieval, and ingestion suites.
+Review aggregated eval results across spoiler, retrieval, ingestion, and workflow suites.
 Return JSON only with keys:
 - overall_pass: boolean
 - score: number from 0 to 100
@@ -54,6 +65,7 @@ JUDGE_USER_TEMPLATES: dict[str, str] = {
     "spoiler": "Review this eval report for Oracle recommendation #2 (spoiler guard semantics).\n\n{payload}",
     "retrieval": "Review this eval report for Oracle recommendation #3 (product-level retrieval evals).\n\n{payload}",
     "ingestion": "Review this eval report for P1 ingestion reliability (warnings and duplicate detection).\n\n{payload}",
+    "workflow": "Review this eval report for P2 workflow polish (session export/reset, config diagnostics).\n\n{payload}",
     "all": "Review this aggregated eval report across all product suites.\n\n{payload}",
 }
 
@@ -116,11 +128,24 @@ def run_ingestion_eval(workspace: Path | None = None) -> list[EvalResult]:
     return results
 
 
+def run_workflow_eval(workspace: Path | None = None) -> list[EvalResult]:
+    tmp_root = _eval_workspace(workspace)
+
+    results: list[EvalResult] = []
+    results.append(_eval_session_export_includes_metadata(tmp_root))
+    results.append(_eval_session_reset_clears_history(tmp_root))
+    results.append(_eval_session_reset_keep_position(tmp_root))
+    results.append(_eval_config_describe_includes_workspace(tmp_root))
+    results.append(_eval_config_masks_api_keys())
+    return results
+
+
 def run_all_evals(workspace: Path | None = None) -> dict[str, list[EvalResult]]:
     return {
         "spoiler": run_spoiler_eval(workspace),
         "retrieval": run_retrieval_eval(workspace),
         "ingestion": run_ingestion_eval(workspace),
+        "workflow": run_workflow_eval(workspace),
     }
 
 
@@ -377,6 +402,126 @@ def _eval_content_start_detected(workspace: Path) -> EvalResult:
         passed=passed,
         details=f"content_start_chapter={start}",
         evidence={"content_start_chapter": start},
+    )
+
+
+def _eval_session_export_includes_metadata(workspace: Path) -> EvalResult:
+    (workspace / "pyproject.toml").touch()
+    record, paths = build_standard_eval_book(workspace)
+    save_session(
+        paths,
+        {
+            "current_chapter": 3,
+            "max_chapter": 3,
+            "show_sources": True,
+            "history": [
+                {"role": "user", "content": "What are platforms?"},
+                {"role": "assistant", "content": "Platforms serve users first."},
+            ],
+        },
+    )
+    export_path = export_session(paths, record)
+    payload = json.loads(export_path.read_text(encoding="utf-8"))
+    passed = (
+        payload.get("book_id") == "eval-book"
+        and payload.get("title")
+        and payload.get("exported_at")
+        and payload.get("reading_position", {}).get("current_chapter") == 3
+        and payload.get("turn_count") == 1
+        and len(payload.get("history", [])) == 2
+    )
+    return EvalResult(
+        id="session_export_includes_metadata",
+        description="Session export writes book metadata, position, and conversation history",
+        passed=passed,
+        details=f"keys={sorted(payload.keys())}",
+        evidence={"export_path": str(export_path), "turn_count": payload.get("turn_count")},
+    )
+
+
+def _eval_session_reset_clears_history(workspace: Path) -> EvalResult:
+    record, paths = build_standard_eval_book(workspace)
+    save_session(
+        paths,
+        {
+            "current_chapter": 2,
+            "max_chapter": 2,
+            "show_sources": True,
+            "history": [{"role": "user", "content": "hello"}],
+        },
+    )
+    cleared = reset_session(paths, keep_position=False)
+    session = load_session(paths)
+    passed = (
+        cleared.get("history") == []
+        and session.get("history") == []
+        and session.get("current_chapter") is None
+        and session.get("max_chapter") is None
+        and session.get("show_sources") is False
+    )
+    return EvalResult(
+        id="session_reset_clears_history",
+        description="Session reset clears conversation and reading position",
+        passed=passed,
+        details=f"session={session}",
+        evidence={"session": session},
+    )
+
+
+def _eval_session_reset_keep_position(workspace: Path) -> EvalResult:
+    record, paths = build_standard_eval_book(workspace)
+    save_session(
+        paths,
+        {
+            "current_chapter": 4,
+            "max_chapter": 4,
+            "history": [{"role": "user", "content": "keep me"}],
+        },
+    )
+    reset_session(paths, keep_position=True)
+    session = load_session(paths)
+    passed = (
+        session.get("current_chapter") == 4
+        and session.get("max_chapter") == 4
+        and session.get("history") == []
+    )
+    return EvalResult(
+        id="session_reset_keep_position",
+        description="Session reset can preserve reading position while clearing history",
+        passed=passed,
+        details=f"session={session}",
+        evidence={"session": session},
+    )
+
+
+def _eval_config_describe_includes_workspace(workspace: Path) -> EvalResult:
+    (workspace / "pyproject.toml").touch()
+    config = describe_config(workspace)
+    passed = (
+        config.get("workspace_root")
+        and config.get("books_dir")
+        and config.get("python_version")
+        and isinstance(config.get("recommended_models"), list)
+    )
+    return EvalResult(
+        id="config_describe_includes_workspace",
+        description="Config diagnostics include workspace paths and runtime info",
+        passed=bool(passed),
+        details=f"workspace_root={config.get('workspace_root')}",
+        evidence={"keys": sorted(config.keys())},
+    )
+
+
+def _eval_config_masks_api_keys() -> EvalResult:
+    masked = mask_secret("sk-abcdefghijklmnop")
+    passed = masked is not None and "..." in masked and "sk-a" in masked and "mnop" in masked
+    passed = passed and mask_secret(None) is None
+    return EvalResult(
+        id="config_masks_api_keys",
+        description="Config diagnostics mask API key secrets",
+        passed=passed,
+        details=f"masked={masked}",
+        evidence={"masked": masked},
     )
 
 
