@@ -10,6 +10,7 @@ from .companion import CompanionError, answer_question, chat_loop, set_reading_p
 from .llm import RECOMMENDED_MODELS
 from .config import describe_config
 from .doctor import doctor_has_failures, run_doctor
+from .export_html import export_chapter_html_for_book, parse_spine_range, validate_export_selector
 from .pipeline import delete_book, ingest_source, list_books, load_book_record
 from .session_io import export_session, reset_session, session_summary
 from .paths import WorkspaceDiscoveryError
@@ -123,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     delete = subparsers.add_parser("delete", help="Remove an ingested book from the workspace")
     delete.add_argument("book_id", help="Previously ingested book id")
+
+    export_html = subparsers.add_parser(
+        "export-html",
+        help="Export an EPUB chapter as standalone HTML with images",
+    )
+    export_html.add_argument("book_id", help="Previously ingested book id")
+    export_html.add_argument("--chapter", type=int, help="Book chapter number from the EPUB TOC")
+    export_html.add_argument("--title", help="Match the first spine chapter title containing this text")
+    export_html.add_argument("--spine", help="Explicit spine index range, e.g. 43-48")
+    export_html.add_argument("--output", type=Path, help="Destination HTML file")
 
     eval_cmd = subparsers.add_parser("eval", help="Run product eval suites")
     eval_sub = eval_cmd.add_subparsers(dest="eval_command", required=True)
@@ -432,6 +443,43 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "delete":
             paths = delete_book(args.book_id, workspace)
             print(f"Deleted book `{args.book_id}` from {paths.book_dir.parent}")
+            return 0
+
+        if args.command == "export-html":
+            validate_export_selector(
+                chapter_number=args.chapter,
+                title=args.title,
+                spine=args.spine,
+            )
+            spine_from = None
+            spine_to = None
+            if args.spine:
+                spine_from, spine_to = parse_spine_range(args.spine)
+            destination, image_count, recovered_images, missing_images = export_chapter_html_for_book(
+                args.book_id,
+                workspace=workspace,
+                chapter_number=args.chapter,
+                title=args.title,
+                spine_from=spine_from,
+                spine_to=spine_to,
+                output_path=args.output,
+            )
+            html = destination.read_text(encoding="utf-8")
+            word_count = "unknown"
+            spine_range = "unknown"
+            if 'data-word-count="' in html:
+                word_count = html.split('data-word-count="', 1)[1].split('"', 1)[0]
+            if 'data-spine-range="' in html:
+                spine_range = html.split('data-spine-range="', 1)[1].split('"', 1)[0]
+            print(f"Exported HTML to {destination}")
+            print(f"Spine range: {spine_range} · Words: {word_count}")
+            if image_count:
+                images_dir = destination.parent / f"{destination.stem}-images"
+                print(f"Images: {image_count} file(s) in {images_dir}")
+            if recovered_images:
+                print(f"Recovered from fallback: {', '.join(sorted(set(recovered_images)))}")
+            if missing_images:
+                print(f"Still missing: {', '.join(sorted(set(missing_images)))}")
             return 0
 
         if args.command == "eval":
